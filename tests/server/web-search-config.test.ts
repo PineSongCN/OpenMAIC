@@ -14,6 +14,7 @@ describe('server web search config', () => {
     delete process.env.BAIDU_BASE_URL;
     delete process.env.WEB_SEARCH_MINIMAX_API_KEY;
     delete process.env.WEB_SEARCH_MINIMAX_BASE_URL;
+    delete process.env.SEARXNG_BASE_URL;
   });
 
   it('rejects client-controlled base URLs outside the provider allowlist', async () => {
@@ -92,6 +93,32 @@ describe('server web search config', () => {
       apiKey: 'minimax-server-key',
       baseUrl: 'https://api.minimaxi.com',
     });
+  });
+
+  it('allows self-hosted SearXNG client base URLs', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(
+      resolveSafeClientWebSearchBaseUrl('searxng', 'http://192.168.161.100:6060/search'),
+    ).toBe('http://192.168.161.100:6060');
+  });
+
+  it('resolves SearXNG classroom web search config from server base URL', async () => {
+    vi.stubEnv('SEARXNG_BASE_URL', 'http://192.168.161.100:6060');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(resolveClassroomWebSearchConfig({ webSearchProviderId: 'searxng' })).toEqual({
+      providerId: 'searxng',
+      apiKey: '',
+      baseUrl: 'http://192.168.161.100:6060',
+    });
+  });
+
+  it('returns undefined for SearXNG classroom config without a base URL', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(resolveClassroomWebSearchConfig({ webSearchProviderId: 'searxng' })).toBeUndefined();
   });
 
   it('keeps Baidu sub-source toggles in classroom web search config', async () => {

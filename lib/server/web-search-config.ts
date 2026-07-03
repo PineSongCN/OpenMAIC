@@ -33,6 +33,7 @@ const OFFICIAL_CLIENT_BASE_URLS: Record<WebSearchProviderId, string[]> = {
     'https://api.minimax.io/v1/coding_plan/search',
   ],
   doubao: ['https://open.feedcoopapi.com', 'https://open.feedcoopapi.com/search_api/web_search'],
+  searxng: [],
 };
 
 function normalizeBaseUrl(value: string): string {
@@ -55,9 +56,16 @@ export function resolveSafeClientWebSearchBaseUrl(
   let normalized: string;
   try {
     const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Invalid protocol');
+    }
     normalized = normalizeBaseUrl(parsed.toString());
   } catch {
     throw new Error(`Unsupported ${WEB_SEARCH_PROVIDERS[providerId].name} base URL`);
+  }
+
+  if (providerId === 'searxng') {
+    return normalized.replace(/\/search\/?$/, '');
   }
 
   const allowed = OFFICIAL_CLIENT_BASE_URLS[providerId].map(normalizeBaseUrl);
@@ -98,10 +106,13 @@ export function resolveClassroomWebSearchConfig(input: {
   const apiKey = resolveWebSearchApiKey(providerId, input.webSearchApiKey);
   if (provider.requiresApiKey && !apiKey) return undefined;
 
+  const baseUrl = resolveWebSearchBaseUrl(providerId);
+  if (provider.requiresBaseUrl && !baseUrl) return undefined;
+
   return {
     providerId,
     apiKey,
-    baseUrl: resolveWebSearchBaseUrl(providerId),
+    baseUrl,
     ...(providerId === 'baidu' && input.baiduSubSources
       ? { baiduSubSources: input.baiduSubSources }
       : {}),

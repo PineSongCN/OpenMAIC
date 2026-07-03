@@ -58,7 +58,64 @@ export const WEB_SEARCH_PROVIDERS: Record<WebSearchProviderId, WebSearchProvider
     endpointPath: '/search_api/web_search',
     icon: '/logos/doubao.svg',
   },
+  searxng: {
+    id: 'searxng',
+    name: 'SearXNG',
+    requiresApiKey: false,
+    requiresBaseUrl: true,
+    endpointPath: '/search',
+  },
 };
+
+export function isWebSearchProviderConfigured(
+  provider: WebSearchProviderConfig,
+  cfg?: { apiKey?: string; baseUrl?: string; isServerConfigured?: boolean },
+): boolean {
+  if (cfg?.isServerConfigured) return true;
+  if (provider.requiresApiKey) return !!cfg?.apiKey;
+  if (provider.requiresBaseUrl) return !!cfg?.baseUrl;
+  return true;
+}
+
+function isWebSearchConfigUsable(
+  providerId: WebSearchProviderId,
+  cfg?: {
+    apiKey?: string;
+    baseUrl?: string;
+    isServerConfigured?: boolean;
+    requiresApiKey?: boolean;
+  },
+): boolean {
+  if (!cfg) return false;
+  if (cfg.isServerConfigured) return true;
+
+  const provider = WEB_SEARCH_PROVIDERS[providerId];
+  const requiresApiKey = cfg.requiresApiKey ?? provider.requiresApiKey;
+  if (!requiresApiKey) {
+    if (provider.requiresBaseUrl) return !!cfg.baseUrl;
+    return true;
+  }
+  return !!cfg.apiKey;
+}
+
+/** Server-managed providers first, then other usable client providers. */
+export function buildWebSearchFallbackOrder(
+  config: Partial<
+    Record<
+      WebSearchProviderId,
+      { apiKey?: string; baseUrl?: string; isServerConfigured?: boolean; requiresApiKey?: boolean }
+    >
+  >,
+): WebSearchProviderId[] {
+  const ids = Object.keys(WEB_SEARCH_PROVIDERS) as WebSearchProviderId[];
+  const serverManaged = ids.filter(
+    (id) => isWebSearchConfigUsable(id, config[id]) && config[id]?.isServerConfigured,
+  );
+  const clientUsable = ids.filter(
+    (id) => isWebSearchConfigUsable(id, config[id]) && !config[id]?.isServerConfigured,
+  );
+  return [...serverManaged, ...clientUsable];
+}
 
 export const BAIDU_SUB_SOURCES: Record<
   keyof BaiduSubSources,

@@ -8,7 +8,7 @@
 import { NextRequest } from 'next/server';
 import { callLLM } from '@/lib/ai/llm';
 import { formatSearchResultsAsContext, searchWeb } from '@/lib/web-search';
-import { isServerConfiguredProvider, resolveWebSearchApiKey } from '@/lib/server/provider-config';
+import { isServerConfiguredProvider, resolveServerWebSearchProviderId, resolveWebSearchApiKey } from '@/lib/server/provider-config';
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
 import {
@@ -48,8 +48,26 @@ export async function POST(req: NextRequest) {
       return apiError('MISSING_REQUIRED_FIELD', 400, 'query is required');
     }
 
-    const providerId: WebSearchProviderId =
-      requestProviderId && WEB_SEARCH_PROVIDERS[requestProviderId] ? requestProviderId : 'tavily';
+    const serverProviderId = resolveServerWebSearchProviderId() as WebSearchProviderId | undefined;
+    let providerId: WebSearchProviderId =
+      requestProviderId && WEB_SEARCH_PROVIDERS[requestProviderId]
+        ? requestProviderId
+        : (serverProviderId ?? 'tavily');
+
+    // Prefer the operator's server-configured backend over stale client defaults
+    // (e.g. Tavily without a key, or Brave HTML scrape with empty results).
+    if (
+      serverProviderId &&
+      isServerConfiguredProvider('webSearch', serverProviderId) &&
+      providerId !== serverProviderId &&
+      !isServerConfiguredProvider('webSearch', providerId)
+    ) {
+      log.info(
+        `Using server-configured web search provider "${serverProviderId}" instead of "${providerId}"`,
+      );
+      providerId = serverProviderId;
+    }
+
     const provider = WEB_SEARCH_PROVIDERS[providerId];
     // Managed providers are admin-owned: ignore (don't reject) any client-sent
     // key/baseUrl. The server config is authoritative, so a stale client base
@@ -71,6 +89,13 @@ export async function POST(req: NextRequest) {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Invalid web search base URL';
       return apiError('INVALID_REQUEST', 400, message);
+    }
+    if (provider.requiresBaseUrl && !baseUrl) {
+      return apiError(
+        'MISSING_REQUIRED_FIELD',
+        400,
+        `${provider.name} base URL is not configured. Set ${getWebSearchEnvKey(providerId)} on the server or configure the base URL in Settings -> Web Search.`,
+      );
     }
 
     // Clamp rewrite input at the route boundary; framework body limits still apply to total request size.
@@ -145,6 +170,8 @@ function getWebSearchEnvKey(providerId: WebSearchProviderId): string {
       return 'BRAVE_API_KEY';
     case 'minimax':
       return 'WEB_SEARCH_MINIMAX_API_KEY';
+    case 'searxng':
+      return 'SEARXNG_BASE_URL';
     case 'tavily':
     default:
       return 'TAVILY_API_KEY';
