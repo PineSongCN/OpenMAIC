@@ -98,9 +98,9 @@ describe('server web search config', () => {
   it('allows self-hosted SearXNG client base URLs', async () => {
     const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
 
-    expect(
-      resolveSafeClientWebSearchBaseUrl('searxng', 'http://192.168.161.100:6060/search'),
-    ).toBe('http://192.168.161.100:6060');
+    expect(resolveSafeClientWebSearchBaseUrl('searxng', 'http://192.168.161.100:6060/search')).toBe(
+      'http://192.168.161.100:6060',
+    );
   });
 
   it('resolves SearXNG classroom web search config from server base URL', async () => {

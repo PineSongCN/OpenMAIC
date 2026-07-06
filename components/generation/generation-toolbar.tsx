@@ -18,7 +18,11 @@ import { useSettingsStore } from '@/lib/store/settings';
 import { isLLMProviderConfigured } from '@/lib/store/settings-validation';
 import { PDF_PROVIDERS } from '@/lib/pdf/constants';
 import type { PDFProviderId } from '@/lib/pdf/types';
-import { WEB_SEARCH_PROVIDERS, getWebSearchProviderDisplayName, isWebSearchProviderConfigured } from '@/lib/web-search/constants';
+import {
+  WEB_SEARCH_PROVIDERS,
+  getWebSearchProviderDisplayName,
+  isWebSearchProviderConfigured,
+} from '@/lib/web-search/constants';
 import type { WebSearchProviderId } from '@/lib/web-search/types';
 import type { ProviderId } from '@/lib/ai/providers';
 import type {

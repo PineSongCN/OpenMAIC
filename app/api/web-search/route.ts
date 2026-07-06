@@ -8,7 +8,11 @@
 import { NextRequest } from 'next/server';
 import { callLLM } from '@/lib/ai/llm';
 import { formatSearchResultsAsContext, searchWeb } from '@/lib/web-search';
-import { isServerConfiguredProvider, resolveServerWebSearchProviderId, resolveWebSearchApiKey } from '@/lib/server/provider-config';
+import {
+  isServerConfiguredProvider,
+  resolveServerWebSearchProviderId,
+  resolveWebSearchApiKey,
+} from '@/lib/server/provider-config';
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
 import {
