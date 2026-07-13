@@ -41,6 +41,20 @@ describe('web search provider constants', () => {
     expect(getAllWebSearchProviders().map((provider) => provider.id)).toContain('searxng');
   });
 
+  it('does not treat client-supplied SearXNG base URL as configured', () => {
+    const order = buildWebSearchFallbackOrder({
+      searxng: {
+        apiKey: '',
+        baseUrl: 'http://192.168.161.100:6060',
+        requiresApiKey: false,
+      },
+      brave: { apiKey: '', requiresApiKey: false },
+    });
+
+    expect(order).not.toContain('searxng');
+    expect(order).toContain('brave');
+  });
+
   it('prioritizes server-managed web search providers in fallback order', () => {
     const order = buildWebSearchFallbackOrder({
       tavily: { apiKey: '', requiresApiKey: true },

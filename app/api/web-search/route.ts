@@ -78,7 +78,9 @@ export async function POST(req: NextRequest) {
     // URL is dropped rather than failing the request.
     const managed = isServerConfiguredProvider('webSearch', providerId);
     const clientApiKey = managed ? undefined : bodyApiKey;
-    const clientBaseUrl = managed ? undefined : bodyBaseUrl;
+    // SearXNG base URLs are operator-managed only (SEARXNG_BASE_URL); never trust client input.
+    const clientBaseUrl =
+      managed || providerId === 'searxng' ? undefined : bodyBaseUrl;
     const apiKey = resolveWebSearchApiKey(providerId, clientApiKey);
     if (provider.requiresApiKey && !apiKey) {
       return apiError(
@@ -95,11 +97,7 @@ export async function POST(req: NextRequest) {
       return apiError('INVALID_REQUEST', 400, message);
     }
     if (provider.requiresBaseUrl && !baseUrl) {
-      return apiError(
-        'MISSING_REQUIRED_FIELD',
-        400,
-        `${provider.name} base URL is not configured. Set ${getWebSearchEnvKey(providerId)} on the server or configure the base URL in Settings -> Web Search.`,
-      );
+      return apiError('MISSING_REQUIRED_FIELD', 400, getMissingBaseUrlMessage(providerId, provider.name));
     }
 
     // Clamp rewrite input at the route boundary; framework body limits still apply to total request size.
@@ -162,6 +160,13 @@ export async function POST(req: NextRequest) {
     const message = err instanceof Error ? err.message : 'Web search failed';
     return apiError('INTERNAL_ERROR', 500, message);
   }
+}
+
+function getMissingBaseUrlMessage(providerId: WebSearchProviderId, providerName: string): string {
+  if (providerId === 'searxng') {
+    return `${providerName} base URL is not configured. Set SEARXNG_BASE_URL on the server.`;
+  }
+  return `${providerName} base URL is not configured. Set ${getWebSearchEnvKey(providerId)} on the server or configure the base URL in Settings -> Web Search.`;
 }
 
 function getWebSearchEnvKey(providerId: WebSearchProviderId): string {

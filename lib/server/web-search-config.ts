@@ -64,10 +64,6 @@ export function resolveSafeClientWebSearchBaseUrl(
     throw new Error(`Unsupported ${WEB_SEARCH_PROVIDERS[providerId].name} base URL`);
   }
 
-  if (providerId === 'searxng') {
-    return normalized.replace(/\/search\/?$/, '');
-  }
-
   const allowed = OFFICIAL_CLIENT_BASE_URLS[providerId].map(normalizeBaseUrl);
   if (!allowed.includes(normalized)) {
     throw new Error(`Unsupported ${WEB_SEARCH_PROVIDERS[providerId].name} base URL`);

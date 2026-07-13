@@ -58,7 +58,7 @@ export async function searchWithSearxng(params: {
 
   if (!baseUrl?.trim()) {
     throw new Error(
-      'SearXNG base URL is not configured. Set SEARXNG_BASE_URL on the server or configure the base URL in Settings -> Web Search.',
+      'SearXNG base URL is not configured. Set SEARXNG_BASE_URL on the server.',
     );
   }
 

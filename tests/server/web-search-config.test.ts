@@ -95,11 +95,16 @@ describe('server web search config', () => {
     });
   });
 
-  it('allows self-hosted SearXNG client base URLs', async () => {
+  it.each([
+    'http://127.0.0.1:6060',
+    'http://localhost:6060',
+    'http://169.254.169.254',
+    'http://192.168.161.100:6060/search',
+  ])('rejects client-supplied SearXNG base URLs (%s)', async (baseUrl) => {
     const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
 
-    expect(resolveSafeClientWebSearchBaseUrl('searxng', 'http://192.168.161.100:6060/search')).toBe(
-      'http://192.168.161.100:6060',
+    expect(() => resolveSafeClientWebSearchBaseUrl('searxng', baseUrl)).toThrow(
+      'Unsupported SearXNG base URL',
     );
   });
 

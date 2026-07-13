@@ -72,6 +72,8 @@ export function isWebSearchProviderConfigured(
   cfg?: { apiKey?: string; baseUrl?: string; isServerConfigured?: boolean },
 ): boolean {
   if (cfg?.isServerConfigured) return true;
+  // SearXNG base URLs are operator-managed only; client settings must not count.
+  if (provider.id === 'searxng') return false;
   if (provider.requiresApiKey) return !!cfg?.apiKey;
   if (provider.requiresBaseUrl) return !!cfg?.baseUrl;
   return true;
@@ -90,6 +92,7 @@ function isWebSearchConfigUsable(
   if (cfg.isServerConfigured) return true;
 
   const provider = WEB_SEARCH_PROVIDERS[providerId];
+  if (providerId === 'searxng') return false;
   const requiresApiKey = cfg.requiresApiKey ?? provider.requiresApiKey;
   if (!requiresApiKey) {
     if (provider.requiresBaseUrl) return !!cfg.baseUrl;

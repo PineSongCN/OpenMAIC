@@ -229,8 +229,57 @@ describe('POST /api/web-search', () => {
       query: 'test query',
       providerId: 'searxng',
     });
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json).toMatchObject({
+      success: false,
+      errorCode: 'MISSING_REQUIRED_FIELD',
+    });
+    expect(json.error).toContain('SEARXNG_BASE_URL');
+    expect(json.error).not.toContain('Settings');
+    expect(mocks.searchWeb).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'http://127.0.0.1:6060',
+    'http://localhost:6060',
+    'http://169.254.169.254',
+    'http://192.168.161.100:6060',
+  ])('ignores client-supplied SearXNG base URLs without server config (%s)', async (baseUrl) => {
+    const res = await postWebSearch({
+      query: 'test query',
+      providerId: 'searxng',
+      baseUrl,
+    });
 
     expect(res.status).toBe(400);
     expect(mocks.searchWeb).not.toHaveBeenCalled();
   });
+
+  it.each([
+    'http://127.0.0.1:6060',
+    'http://localhost:6060',
+    'http://169.254.169.254',
+    'http://10.0.0.5:6060',
+  ])(
+    'uses operator-configured SearXNG URL and ignores client-supplied base URL (%s)',
+    async (clientBaseUrl) => {
+      vi.stubEnv('SEARXNG_BASE_URL', 'http://192.168.161.100:6060');
+
+      const res = await postWebSearch({
+        query: 'test query',
+        providerId: 'searxng',
+        baseUrl: clientBaseUrl,
+      });
+
+      expect(res.status).toBe(200);
+      expect(mocks.searchWeb).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providerId: 'searxng',
+          baseUrl: 'http://192.168.161.100:6060',
+        }),
+      );
+    },
+  );
 });
