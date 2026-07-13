@@ -11,9 +11,7 @@ const searxngBaseUrl = process.env.SEARXNG_BASE_URL?.trim();
 const describeSmoke = searxngBaseUrl ? describe : describe.skip;
 
 describeSmoke('SearXNG live smoke', () => {
-  it(
-    'returns structured sources from the JSON API',
-    async () => {
+  it('returns structured sources from the JSON API', async () => {
     const result = await searchWithSearxng({
       query: 'open source software',
       baseUrl: searxngBaseUrl,
@@ -28,7 +26,5 @@ describeSmoke('SearXNG live smoke', () => {
     }
     expect(result.query).toEqual(expect.any(String));
     expect(result.responseTime).toBeGreaterThan(0);
-    },
-    30_000,
-  );
+  }, 30_000);
 });

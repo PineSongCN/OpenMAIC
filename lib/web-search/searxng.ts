@@ -57,9 +57,7 @@ export async function searchWithSearxng(params: {
   const query = normalizeWebSearchQuery(rawQuery);
 
   if (!baseUrl?.trim()) {
-    throw new Error(
-      'SearXNG base URL is not configured. Set SEARXNG_BASE_URL on the server.',
-    );
+    throw new Error('SearXNG base URL is not configured. Set SEARXNG_BASE_URL on the server.');
   }
 
   const startedAt = Date.now();

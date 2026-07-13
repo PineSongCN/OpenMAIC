@@ -79,8 +79,7 @@ export async function POST(req: NextRequest) {
     const managed = isServerConfiguredProvider('webSearch', providerId);
     const clientApiKey = managed ? undefined : bodyApiKey;
     // SearXNG base URLs are operator-managed only (SEARXNG_BASE_URL); never trust client input.
-    const clientBaseUrl =
-      managed || providerId === 'searxng' ? undefined : bodyBaseUrl;
+    const clientBaseUrl = managed || providerId === 'searxng' ? undefined : bodyBaseUrl;
     const apiKey = resolveWebSearchApiKey(providerId, clientApiKey);
     if (provider.requiresApiKey && !apiKey) {
       return apiError(
@@ -97,7 +96,11 @@ export async function POST(req: NextRequest) {
       return apiError('INVALID_REQUEST', 400, message);
     }
     if (provider.requiresBaseUrl && !baseUrl) {
-      return apiError('MISSING_REQUIRED_FIELD', 400, getMissingBaseUrlMessage(providerId, provider.name));
+      return apiError(
+        'MISSING_REQUIRED_FIELD',
+        400,
+        getMissingBaseUrlMessage(providerId, provider.name),
+      );
     }
 
     // Clamp rewrite input at the route boundary; framework body limits still apply to total request size.
