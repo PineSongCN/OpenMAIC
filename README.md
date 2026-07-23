@@ -39,6 +39,7 @@
 
 ## 🗞️ News
 
+- **2026-07-21** — [v0.3.1 released!](https://github.com/THU-MAIC/OpenMAIC/releases/tag/v0.3.1) One-click MP4 video export; server-backed runtime storage with a Postgres reference server; direct slide manipulation in the editor (drag, resize, rotate, multi-select); smarter "Edit with AI" (validated JSON Patch edits, multi-session history); expanded Document Parsing (multi-format upload, audio/video extraction, AliDocMind, MinerU); new providers (Azure OpenAI, SearXNG, ComfyUI) and the GPT-5.6 model family; action-level playback navigation; SSRF hardening. See [changelog](CHANGELOG.md).
 - **2026-06-28** — [v0.3.0 released!](https://github.com/THU-MAIC/OpenMAIC/releases/tag/v0.3.0) Project-Based Learning (PBL) v2 with classroom UI; "Edit with AI" Pro-mode editor agent; the `@openmaic/*` SDK family (DSL/renderer/importer) published to npm; optional per-stage model routing; new models (GLM-5.2, Kimi K2.7 Code, Qwen3.7 Plus/Max); a vocational-learning task engine; Korean (ko-KR) locale; and relicensing from AGPL-3.0 to MIT. See [changelog](CHANGELOG.md).
 - **2026-06-02** — [v0.2.2 released!](https://github.com/THU-MAIC/OpenMAIC/releases/tag/v0.2.2) MAIC Editor (v0) Pro Mode for editing generated slides; editable outline before generation; offline-ready classroom export; new search providers (Brave/Baidu/Bocha/MiniMax) and Azure STT; new models (Claude Opus 4.8, MiniMax M3, Gemini 3.5 Flash); Traditional Chinese (zh-TW) and Brazilian Portuguese (pt-BR) locales. See [changelog](CHANGELOG.md).
 - **2026-04-26** — [v0.2.1 released!](https://github.com/THU-MAIC/OpenMAIC/releases/tag/v0.2.1) Integrated [VoxCPM2](https://github.com/OpenBMB/VoxCPM) TTS with voice cloning and on-the-fly auto-generated voices; added per-model thinking config; added end-of-course completion page with persistent quiz state; added latest released models including DeepSeek-V4 / GPT-5.5 / GPT-Image-2 / Xiaomi MiMo / Hy3. See [changelog](CHANGELOG.md).
@@ -105,6 +106,9 @@ Fill in at least one LLM provider key:
 
 ```env
 OPENAI_API_KEY=sk-...
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_BASE_URL=https://YOUR-RESOURCE.openai.azure.com/openai
+AZURE_OPENAI_MODELS=YOUR-DEPLOYMENT-NAME
 ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=...
 GROK_API_KEY=xai-...
@@ -119,11 +123,16 @@ You can also configure providers via `server-providers.yml`:
 providers:
   openai:
     apiKey: sk-...
+  azure:
+    apiKey: ...
+    baseUrl: https://YOUR-RESOURCE.openai.azure.com/openai
+    models:
+      - YOUR-DEPLOYMENT-NAME
   anthropic:
     apiKey: sk-ant-...
 ```
 
-Supported providers: **OpenAI**, **Anthropic**, **Google Gemini**, **DeepSeek**, **Qwen**, **Kimi**, **MiniMax**, **Grok (xAI)**, **OpenRouter**, **Doubao**, **Tencent Hunyuan/TokenHub**, **Xiaomi MiMo**, **GLM (Zhipu)**, **Ollama** (local), **Lemonade** (local LLM / image / TTS / ASR), and any OpenAI-compatible API.
+Supported providers: **OpenAI**, **Azure OpenAI**, **Anthropic**, **Google Gemini**, **DeepSeek**, **Qwen**, **Kimi**, **MiniMax**, **Grok (xAI)**, **OpenRouter**, **Doubao**, **Tencent Hunyuan/TokenHub**, **Xiaomi MiMo**, **GLM (Zhipu)**, **Ollama** (local), **Lemonade** (local LLM / image / TTS / ASR), and any OpenAI-compatible API.
 
 <a id="lemonade-local-ai"></a>
 
@@ -239,6 +248,18 @@ cp .env.example .env.local
 # Edit .env.local with your API keys, then:
 docker compose up --build
 ```
+
+### Optional: MP4 Video Export (Render Service)
+
+The "Export Video" menu builds a self-contained [Hyperframes](https://www.npmjs.com/package/@hyperframes/producer) project entirely in the browser. Turning that into an MP4 needs Chromium + FFmpeg on Node 22, so it runs in an isolated `render-service` container rather than the app.
+
+It's opt-in. Start it with the `video-export` compose profile:
+
+```bash
+docker compose --profile video-export up --build
+```
+
+The app auto-detects the service via `RENDER_SERVICE_URL` (preset in `docker-compose.yml`) and enables one-click MP4 rendering. Without the profile — or when `RENDER_SERVICE_URL` is unset — export degrades to downloading the project ZIP for local CLI rendering. See [`render-service/README.md`](render-service/README.md) for standalone setup and tuning (`RENDER_MAX_CONCURRENCY`, etc.).
 
 ### Optional: MinerU (Advanced Document Parsing)
 
