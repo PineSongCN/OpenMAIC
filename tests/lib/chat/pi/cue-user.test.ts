@@ -1,9 +1,62 @@
 import { describe, expect, it } from 'vitest';
+import { validateToolArguments } from '@earendil-works/pi-ai';
 import { buildCallAgentTool } from '@/lib/chat/pi/tools/call-agent';
 import { buildCueUserTool } from '@/lib/chat/pi/tools/cue-user';
+import { normalizeCueUserOptions } from '@/lib/chat/cue-user-options';
 
 describe('Pi chat cue_user tool', () => {
-  it('emits the existing cue_user payload once', async () => {
+  it('describes option bounds without hard schema limits, with no client action schema', () => {
+    const tool = buildCueUserTool({ getLastAgentId: () => 'default-1', cueUser: async () => true });
+    const { prompt, options } = tool.parameters.properties as unknown as Record<
+      'prompt' | 'options',
+      { description?: string; items?: object }
+    >;
+    expect(options).toMatchObject({ type: 'array', items: { type: 'string' } });
+    for (const key of ['minItems', 'maxItems']) expect(options).not.toHaveProperty(key);
+    for (const key of ['minLength', 'maxLength']) {
+      expect(options.items).not.toHaveProperty(key);
+      expect(prompt).not.toHaveProperty(key);
+    }
+    expect(options.description).toMatch(/two to four/i);
+    expect(options.description).toContain('60 characters');
+    expect(prompt.description).toContain('240 characters');
+  });
+
+  it('accepts an over-limit call at validation and normalizes it in execute', async () => {
+    const events: unknown[] = [];
+    const tool = buildCueUserTool({
+      getLastAgentId: () => 'default-1',
+      cueUser: async (data) => {
+        events.push(data);
+        return true;
+      },
+    });
+    const longLabel = 'x'.repeat(61);
+    const args = {
+      prompt: 'p'.repeat(300),
+      options: ['One', longLabel, 'Three', 'Four', 'Five'],
+    };
+    const validated = validateToolArguments(tool, {
+      type: 'toolCall',
+      id: 'cue-over-limit',
+      name: 'cue_user',
+      arguments: args,
+    });
+    expect(validated).toEqual(args);
+
+    const result = await tool.execute('cue-over-limit', validated);
+
+    expect(result.details).toEqual({ emitted: true });
+    expect(events).toEqual([
+      {
+        fromAgentId: 'default-1',
+        prompt: 'p'.repeat(240),
+        options: ['One', 'x'.repeat(60), 'Three', 'Four'],
+      },
+    ]);
+  });
+
+  it('emits normalized string suggestions only once', async () => {
     const events: unknown[] = [];
     let userCued = false;
     const tool = buildCueUserTool({
@@ -15,18 +68,34 @@ describe('Pi chat cue_user tool', () => {
         return true;
       },
     });
-
-    const first = await tool.execute('cue-1', { prompt: 'Any follow-up?' });
+    const first = await tool.execute('cue-1', {
+      prompt: ' Any follow-up? ',
+      options: [' Show an example ', 'Back to the lesson', ' Show an example '],
+    });
     const second = await tool.execute('cue-2', { prompt: 'Again?' });
-
     expect(events).toEqual([
       {
         type: 'cue_user',
-        data: { fromAgentId: 'default-1', prompt: 'Any follow-up?' },
+        data: {
+          fromAgentId: 'default-1',
+          prompt: 'Any follow-up?',
+          options: ['Show an example', 'Back to the lesson'],
+        },
       },
     ]);
     expect(first.details).toEqual({ emitted: true });
     expect(second.details).toEqual({ emitted: false });
+  });
+
+  it('normalizes 2-4 unique nonempty labels capped at60chars and omits a lone choice', () => {
+    expect(normalizeCueUserOptions([' ', ' A ', 'A', 'x'.repeat(70), 'C', 'D', 'E'])).toEqual([
+      'A',
+      'x'.repeat(60),
+      'C',
+      'D',
+    ]);
+    expect(normalizeCueUserOptions([' ', ' A ', 'A'])).toBeUndefined();
+    expect(normalizeCueUserOptions()).toBeUndefined();
   });
 
   it('does not emit cue_user before any classroom agent turn when guarded', async () => {
@@ -290,7 +359,7 @@ describe('Pi chat cue_user tool', () => {
     });
   });
 
-  it('does not allow a normal call_agent after the normal agent turn budget is reached', async () => {
+  it('does not allow any call_agent after the agent turn budget is reached', async () => {
     const tool = buildCallAgentTool({
       body: {
         messages: [],
@@ -330,84 +399,21 @@ describe('Pi chat cue_user tool', () => {
       getWhiteboardLedger: () => [],
       maxActionsPerAgent: 1,
       enableWhiteboardTools: false,
-      isTeacherWrapUpUsed: () => false,
     });
+
+    expect(
+      (tool.parameters as { properties?: Record<string, unknown> }).properties,
+    ).not.toHaveProperty('turnKind');
 
     const result = await tool.execute('call-1', {
       agentId: 'teacher-1',
-      instruction: 'Keep explaining.',
+      instruction: 'Give a final summary.',
     });
 
     expect(result.details).toEqual({
       skipped: true,
       reason: 'agent_turn_limit',
       maxAgentTurns: 1,
-      wrapUpAvailable: true,
-    });
-  });
-
-  it('reserves wrap-up turns for the teacher and only once', async () => {
-    const makeTool = (opts: { role: string; wrapUpUsed: boolean }) =>
-      buildCallAgentTool({
-        body: {
-          messages: [],
-          storeState: {
-            stage: { id: 'stage-1', name: 'Stage' },
-            scenes: [],
-            currentSceneId: null,
-            whiteboardOpen: false,
-          },
-          config: { agentIds: ['agent-1'] },
-          apiKey: '',
-        } as never,
-        agentConfigs: [
-          {
-            id: 'agent-1',
-            name: 'Agent',
-            role: opts.role,
-            persona: 'Speak briefly.',
-            avatar: '',
-            color: '#3366ff',
-            allowedActions: [],
-            priority: 10,
-            createdAt: new Date('2026-01-01T00:00:00Z'),
-            updatedAt: new Date('2026-01-01T00:00:00Z'),
-            isDefault: true,
-          },
-        ],
-        send: async () => {},
-        languageModel: {} as never,
-        onAgentDone: () => {},
-        onActionDone: () => {},
-        thinkingConfig: { mode: 'disabled', enabled: false },
-        abortSignal: new AbortController().signal,
-        maxAgentTurns: 1,
-        getAgentTurnCount: () => 1,
-        getAgentResponses: () => [],
-        getWhiteboardLedger: () => [],
-        maxActionsPerAgent: 1,
-        enableWhiteboardTools: false,
-        isTeacherWrapUpUsed: () => opts.wrapUpUsed,
-      });
-
-    await expect(
-      makeTool({ role: 'student', wrapUpUsed: false }).execute('call-1', {
-        agentId: 'agent-1',
-        instruction: 'Wrap up.',
-        turnKind: 'wrap_up',
-      }),
-    ).resolves.toMatchObject({
-      details: { skipped: true, reason: 'wrap_up_requires_teacher' },
-    });
-
-    await expect(
-      makeTool({ role: 'teacher', wrapUpUsed: true }).execute('call-2', {
-        agentId: 'agent-1',
-        instruction: 'Wrap up again.',
-        turnKind: 'wrap_up',
-      }),
-    ).resolves.toMatchObject({
-      details: { skipped: true, reason: 'teacher_wrap_up_already_used' },
     });
   });
 });

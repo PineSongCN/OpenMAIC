@@ -14,13 +14,45 @@
  *
  * This module lives in `lib/video-export-app/` — the impure, app-side companion
  * to the pure `lib/video-export/` compiler — precisely because it reaches into
- * `@/lib/utils/database` and (for video probing) the DOM, the two concerns the
+ * `@/lib/device-storage/database` and (for video probing) the DOM, the two concerns the
  * compiler's purity boundary keeps out.
  */
-import type { PlayVideoAction, SpeechAction, SceneCore } from '@openmaic/dsl';
-import type { AssetMeta, AssetSource, TimingProbe } from '@/lib/video-export';
-import type { Scene } from '@/lib/types/stage';
-import { db, type AudioFileRecord, type MediaFileRecord } from '@/lib/utils/database';
+import type {
+  PPTElement,
+  PPTVideoElement,
+  PlayVideoAction,
+  SpeechAction,
+  SceneCore,
+  SpotlightAction,
+  LaserAction,
+} from '@openmaic/dsl';
+import type {
+  AssetMeta,
+  AssetSource,
+  GeometryProbe,
+  InteractiveHtmlSource,
+  TimingProbe,
+} from '@/lib/video-export';
+import type { Scene, SlideContent, Stage } from '@/lib/types/stage';
+import { enumerateAssetManifest } from '@openmaic/dsl';
+import { isMediaPlaceholder } from '@/lib/store/media-generation';
+import { measureSlideElementGeometry, type MeasuredGeometry } from '@openmaic/renderer/snapshot';
+import {
+  db,
+  mediaFileKey,
+  type AudioFileRecord,
+  type MediaFileRecord,
+} from '@/lib/device-storage/database';
+import {
+  emptyPreparedInteractiveHtmlSet,
+  prepareInteractiveHtmlScenes,
+  type PreparedInteractiveHtmlSet,
+} from './prepare-interactive-html';
+import { useMediaGenerationStore } from '@/lib/store/media-generation';
+import { resolveVideoMediaForElement } from '@/lib/media/media-task-resolution';
+import { resolveAudioBlob } from '@/lib/media/resolve-audio-bytes';
+import { fetchMediaUrl } from '@/lib/media/fetch-media-url';
+import { mapWithConcurrency } from '@/lib/utils/concurrency';
 
 /** Loaded source records, keyed for both metadata (compiler) and byte collection. */
 export interface VideoTimelineRecords {
@@ -30,11 +62,15 @@ export interface VideoTimelineRecords {
   mediaByElementId: Map<string, MediaFileRecord>;
   /** Probed video durations (ms) by `elementId`; absent when unprobeable. */
   videoDurationMsByElementId: Map<string, number>;
+  /** Prepared self-contained HTML pages, addressable by asset id. */
+  interactiveHtml: PreparedInteractiveHtmlSet;
 }
 
 export interface VideoTimelineDeps {
   timing: TimingProbe;
   assets: AssetSource;
+  geometry: GeometryProbe;
+  interactive: InteractiveHtmlSource;
   records: VideoTimelineRecords;
 }
 
@@ -52,30 +88,36 @@ function formatFromMime(mimeType: string | undefined): string | undefined {
   return mimeType?.split('/')[1] || undefined;
 }
 
+/**
+ * The generated-media reference a slide element points at, mirroring the live
+ * playback engine's bridge (`lib/action/engine.ts` `resolveMediaPlaceholderId`):
+ * use the unified video binding so a playable concrete `src` wins over a stale
+ * opaque `mediaRef`; images retain their legacy placeholder selection.
+ *
+ * A `play_video` action targets the slide element by its `.id`, but the media
+ * records are keyed by this ref (`gen_vid_…`), so the asset/duration lookups must
+ * bridge id → ref or every generated video misses and is dropped from the export.
+ */
+function elementMediaRef(
+  el: PPTElement,
+  tasks: ReturnType<typeof useMediaGenerationStore.getState>['tasks'],
+  stageId: string,
+  documentElements: readonly PPTElement[],
+): string | undefined {
+  if (el.type === 'video') {
+    return resolveVideoMediaForElement(tasks, el as PPTVideoElement, stageId, documentElements)
+      .sourceRef;
+  }
+  if (el.type === 'image' && typeof el.src === 'string' && isMediaPlaceholder(el.src)) {
+    return el.src;
+  }
+  return undefined;
+}
+
 /** Per-probe timeout (ms). A blob whose metadata never loads must not wedge export. */
 const PROBE_TIMEOUT_MS = 10_000;
 /** How many media-duration probes run at once (bounded so a big deck can't thrash). */
 const PROBE_CONCURRENCY = 6;
-
-/**
- * Run `worker` over `items` with bounded concurrency, collecting results. Order
- * is not significant to callers (they key results into a Map), so this drains a
- * shared cursor from `PROBE_CONCURRENCY` lanes.
- */
-async function mapWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const i = cursor++;
-      await worker(items[i]);
-    }
-  });
-  await Promise.all(lanes);
-}
 
 /**
  * Probe a video blob's natural duration (ms) via an off-document `<video>`.
@@ -147,33 +189,121 @@ function probeAudioDurationMs(blob: Blob): Promise<number | null> {
  * compiler's sync `videoDurationMs` is a table lookup.
  */
 export async function createVideoTimelineDeps(input: {
-  stage: { id: string };
+  stage: Pick<Stage, 'id' | 'whiteboard' | 'videoManifest'>;
   scenes: Scene[];
+  /**
+   * Skip the off-screen content-box geometry measurement (an off-screen React
+   * render per slide scene). Geometry only positions spotlight/laser/video
+   * effects — it never affects timing — so the subtitles-only path passes `true`
+   * to avoid that cost. Audio/video *duration* probes always run: they set the
+   * timeline (and thus cue timings), so the sidecar SRT/VTT stays in sync with
+   * the burned-in video. Defaults to false (full geometry for the ZIP/render).
+   */
+  skipGeometry?: boolean;
+  /** Skip HTML inlining for subtitle-only compilation. */
+  skipInteractiveHtml?: boolean;
 }): Promise<VideoTimelineDeps> {
-  const { stage, scenes } = input;
+  const { stage, scenes, skipGeometry = false, skipInteractiveHtml = false } = input;
+
+  const interactiveHtml = skipInteractiveHtml
+    ? emptyPreparedInteractiveHtmlSet()
+    : await prepareInteractiveHtmlScenes(scenes);
+
+  // The standardized asset manifest names exactly the media references this
+  // document holds. Video compilation consumes audio only through speech
+  // actions, so narration ids come from the speech pairs below; slide-audio
+  // elements are renderable document assets but never timeline audio clips.
+  // The media load no longer scans the table -- a row no document reference
+  // names (an orphan) was never reachable through the scene-scoped bridge
+  // anyway, and now is not even read.
+  const assetManifest = enumerateAssetManifest({ stage, scenes });
 
   // Audio: load only the records referenced by speech actions.
-  const audioIds = new Set<string>();
+  const speechPairs: Array<{ audioId?: string; audioUrl?: string }> = [];
   for (const scene of scenes) {
     for (const action of scene.actions ?? []) {
-      if (action.type === 'speech' && (action as SpeechAction).audioId) {
-        audioIds.add((action as SpeechAction).audioId!);
-      }
+      if (action.type !== 'speech') continue;
+      const speech = action as SpeechAction;
+      speechPairs.push({
+        audioId: speech.audioId || undefined,
+        audioUrl: (speech as { audioUrl?: string }).audioUrl || undefined,
+      });
     }
   }
+  const manifestAudioRefs = new Set(
+    assetManifest.entries.filter((entry) => entry.kind === 'audio').map((entry) => entry.ref),
+  );
+  // The manifest gates membership, but speech traversal remains the ordering
+  // source. Slide-audio slots can make the same ref appear earlier in manifest
+  // order even though the timeline first consumes a different narration.
+  const audioIds = new Set(
+    speechPairs.flatMap((pair) =>
+      pair.audioId && manifestAudioRefs.has(pair.audioId) ? [pair.audioId] : [],
+    ),
+  );
   const audioById = new Map<string, AudioFileRecord>();
-  for (const audioId of audioIds) {
-    const record = await db.audioFiles.get(audioId);
-    if (record) audioById.set(audioId, record);
+  const resolvedAudio = await mapWithConcurrency(
+    [...audioIds],
+    PROBE_CONCURRENCY,
+    async (audioId) => {
+      // Bytes come only from the shared resolver: pool-first, so a stable-id
+      // regeneration whose mirror write failed (the row then holds the
+      // superseded narration) still exports what the classroom plays; the row's
+      // own blob is the resolver's legacy fallback. The row read here supplies
+      // duration/format/ossKey metadata for the compiler's sync lookups.
+      const record = await db.audioFiles.get(audioId);
+      const blob = await resolveAudioBlob(audioId);
+      return { audioId, blob, record };
+    },
+  );
+  for (const resolved of resolvedAudio) {
+    if (!resolved) continue;
+    const { audioId, blob, record } = resolved;
+    if (blob) {
+      audioById.set(
+        audioId,
+        record ? { ...record, blob } : ({ id: audioId, blob } as AudioFileRecord),
+      );
+    }
   }
+  // An unconverted document can carry narration only as a legacy URL: the
+  // playback paths fall back to it, and the export must too, or a playable
+  // clip renders as missing. Fetched bytes are keyed by the URL itself, which
+  // the lookup below prefers exactly when no id resolves. A URL is fetched
+  // only when its action's id produced no usable bytes -- server-backed
+  // conversion deliberately retains these URLs, and fetching them anyway
+  // would double-download every clip.
+  const legacyAudioUrls = new Set<string>();
+  for (const pair of speechPairs) {
+    if (!pair.audioUrl) continue;
+    const record = pair.audioId ? audioById.get(pair.audioId) : undefined;
+    if (record?.blob.size) continue;
+    legacyAudioUrls.add(pair.audioUrl);
+  }
+  await mapWithConcurrency([...legacyAudioUrls], PROBE_CONCURRENCY, async (url) => {
+    try {
+      const response = await fetchMediaUrl(url, 15_000);
+      if (!response.ok) return;
+      const blob = await response.blob();
+      audioById.set(url, {
+        id: url,
+        blob,
+        format: blob.type.split('/')[1] || 'mp3',
+        createdAt: 0,
+      } as AudioFileRecord);
+    } catch {
+      // An unfetchable legacy URL leaves the clip missing, as before.
+    }
+  });
 
   // Probe real audio durations from the local blobs up front, so the compiler's
   // sync `audioDurationMs` is an accurate table lookup rather than a text-length
-  // estimate. Only local blobs can be probed here; an ossKey-only (evicted)
-  // record has no bytes to read, so it falls back to the stored duration (or
-  // estimate) — the same asymmetry the video probe accepts. Probes run with
-  // bounded concurrency (each has its own timeout) so a large deck resolves
-  // quickly without one stuck blob wedging the export.
+  // estimate. Every retained record has bytes from the shared resolver; a
+  // failed CDN-backed resolution stays missing for both compilation and byte
+  // collection, rather than letting collection retry it after the timeline has
+  // already fallen back to an estimate. Probes run with bounded concurrency
+  // (each has its own timeout) so a large deck resolves quickly without one
+  // stuck blob wedging the export.
   const audioDurationMsByAudioId = new Map<string, number>();
   const probableAudio = [...audioById].filter(([, record]) => record.blob.size > 0);
   await mapWithConcurrency(probableAudio, PROBE_CONCURRENCY, async ([audioId, record]) => {
@@ -181,12 +311,64 @@ export async function createVideoTimelineDeps(input: {
     if (ms !== null) audioDurationMsByAudioId.set(audioId, ms);
   });
 
-  // Media: all generated media for this stage, keyed by elementId.
-  const mediaRecords = await db.mediaFiles.where('stageId').equals(stage.id).toArray();
+  // Media: the records of every media ref the manifest names, keyed by that
+  // ref (`gen_vid_…` / allocated id -- the stored `stageId:` prefix stripped),
+  // NOT the slide element id that `play_video` actions target.
   const mediaByElementId = new Map<string, MediaFileRecord>();
-  for (const record of mediaRecords) {
-    const elementId = record.id.includes(':') ? record.id.split(':').slice(1).join(':') : record.id;
-    mediaByElementId.set(elementId, record);
+  for (const entry of assetManifest.entries) {
+    if (entry.kind === 'audio') continue;
+    const record = await db.mediaFiles
+      .get(mediaFileKey(stage.id, entry.ref))
+      .catch(() => undefined);
+    if (record) mediaByElementId.set(entry.ref, record);
+  }
+
+  // Bridge slide element `.id` → media ref, so a `play_video`/media lookup by the
+  // element id resolves to the record keyed by its ref. Without this every
+  // generated video misses and is silently dropped from the export (compile →
+  // present:false → no `<video>` emitted, no bytes collected). Mirrors the live
+  // engine's `resolveMediaPlaceholderId`.
+  //
+  // Scoped **by scene**, not deck-wide: element ids are only unique within a
+  // slide (e.g. `video_001` recurs across scenes), so a single flat map is
+  // last-writer-wins and would resolve an earlier scene's `play_video` to a
+  // later scene's media ref — the wrong asset and duration. Keying by scene id
+  // keeps each slide's bridge isolated.
+  const mediaRefBySceneElement = new Map<string, Map<string, string>>();
+  const mediaTasks = useMediaGenerationStore.getState().tasks;
+  const documentElements = scenes.flatMap((scene) =>
+    scene.type === 'slide'
+      ? (((scene.content as SlideContent)?.canvas?.elements ?? []) as PPTElement[])
+      : [],
+  );
+  for (const scene of scenes) {
+    if (scene.type !== 'slide') continue;
+    const elements = (scene.content as SlideContent)?.canvas?.elements ?? [];
+    const byElement = new Map<string, string>();
+    for (const el of elements) {
+      const ref = elementMediaRef(el as PPTElement, mediaTasks, stage.id, documentElements);
+      if (ref) byElement.set((el as { id: string }).id, ref);
+    }
+    if (byElement.size > 0) mediaRefBySceneElement.set(scene.id, byElement);
+  }
+  /** Resolve a `play_video` element id to the media map's key (its ref) within a scene, or pass through. */
+  const resolveMediaKey = (elementId: string, sceneId: string): string =>
+    mediaRefBySceneElement.get(sceneId)?.get(elementId) ?? elementId;
+
+  // `timing.videoDurationMs` receives only the action (no scene), but the bridge
+  // above is now scene-scoped, so pre-resolve each `play_video`'s media ref by
+  // (scene, elementId) and key it on the action object. Action identity is
+  // stable end-to-end: the compiler's normalize pass preserves the same action
+  // references and the choreography passes them straight back to
+  // `getVideoDurationMs` — the same identity contract `resolveAvailableVideos`
+  // relies on. Falls back to the raw element id for any action not seen here.
+  const videoRefByAction = new Map<PlayVideoAction, string>();
+  for (const scene of scenes) {
+    for (const action of scene.actions ?? []) {
+      if (action.type !== 'play_video') continue;
+      const playVideo = action as PlayVideoAction;
+      videoRefByAction.set(playVideo, resolveMediaKey(playVideo.elementId, scene.id));
+    }
   }
 
   // Probe video durations up front so `videoDurationMs` can be synchronous.
@@ -202,54 +384,123 @@ export async function createVideoTimelineDeps(input: {
     if (ms !== null) videoDurationMsByElementId.set(elementId, ms);
   });
 
+  // The key a speech action's audio lives under: its id when that resolves,
+  // otherwise the retained legacy URL of an unconverted pair, otherwise the
+  // id again so a miss reports against the id rather than the URL.
+  const audioLookupKey = (action: SpeechAction): string | undefined => {
+    if (action.audioId && audioById.has(action.audioId)) return action.audioId;
+    const legacyUrl = (action as { audioUrl?: string }).audioUrl;
+    if (legacyUrl && audioById.has(legacyUrl)) return legacyUrl;
+    return action.audioId;
+  };
+
   const timing: TimingProbe = {
     audioDurationMs(action: SpeechAction): number | null {
-      if (!action.audioId) return null;
+      const key = audioLookupKey(action);
+      if (!key) return null;
       // Prefer the real probed duration; fall back to the stored TTS duration
       // (older records), then null (→ compiler estimates from text length).
-      const probed = audioDurationMsByAudioId.get(action.audioId);
+      const probed = audioDurationMsByAudioId.get(key);
       if (probed != null) return probed;
-      const record = audioById.get(action.audioId);
+      const record = audioById.get(key);
       if (!record || typeof record.duration !== 'number') return null;
       return Math.round(record.duration * 1000);
     },
     videoDurationMs(action: PlayVideoAction): number | null {
-      return videoDurationMsByElementId.get(action.elementId) ?? null;
+      const key = videoRefByAction.get(action) ?? action.elementId;
+      return videoDurationMsByElementId.get(key) ?? null;
     },
   };
 
   const assets: AssetSource = {
     audio(action: SpeechAction): AssetMeta | null {
-      if (!action.audioId) return null;
-      const record = audioById.get(action.audioId);
-      if (!record) return { id: action.audioId, present: false };
-      const probed = audioDurationMsByAudioId.get(action.audioId);
+      const key = audioLookupKey(action);
+      if (!key) return null;
+      const record = audioById.get(key);
+      if (!record) return { id: key, present: false };
+      const probed = audioDurationMsByAudioId.get(key);
       return {
-        id: action.audioId,
+        id: key,
         mimeType: record.blob.type || undefined,
         format: record.format || 'mp3',
         durationMs:
           probed ?? (typeof record.duration === 'number' ? record.duration * 1000 : undefined),
-        // Present when locally held or fetchable from its CDN ossKey at collect time.
-        present: record.blob.size > 0 || !!record.ossKey,
+        // Retained records always contain bytes resolved before compilation.
+        present: record.blob.size > 0,
       };
     },
-    media(elementId: string, _scene: SceneCore): AssetMeta | null {
-      const record = mediaByElementId.get(elementId);
-      if (!record) return null;
+    media(elementId: string, scene: SceneCore): AssetMeta | null {
+      // `elementId` is the slide element `.id` a `play_video` targets; the media
+      // records are keyed by the element's media ref, so bridge id → ref first,
+      // scoped to this scene (element ids recur across slides).
+      const key = resolveMediaKey(elementId, scene.id);
+      const record = mediaByElementId.get(key);
+      const hasExplicitRef = mediaRefBySceneElement.get(scene.id)?.has(elementId) ?? false;
+      if (!record) {
+        if (!hasExplicitRef) return null;
+        return {
+          id: key,
+          format: key.match(/\.([a-zA-Z0-9]+)(?:[?#]|$)/)?.[1],
+          // Collection still has the pre-resolution browser fetch path. Plan
+          // the asset so that path gets a chance before declaring it missing.
+          present: true,
+        };
+      }
       return {
         id: record.id,
         mimeType: record.mimeType,
         format: formatFromMime(record.mimeType),
-        durationMs: videoDurationMsByElementId.get(elementId),
-        present: mediaPresent(record),
+        durationMs: videoDurationMsByElementId.get(key),
+        present: mediaPresent(record) || hasExplicitRef,
       };
+    },
+  };
+
+  // Pre-measure the rendered content-box geometry of every element a
+  // spotlight/laser/play_video targets, by scene. The compiler's GeometryProbe
+  // is synchronous, so (like durations) this async off-screen render happens up
+  // front and the probe is a table lookup. Measuring the `.element-content` box
+  // (auto-height text + 10px padding) — the same box the live overlay and the
+  // frame PNG use — aligns effects with where the element actually paints
+  // instead of its authored outer box (issue #867 item 5).
+  //
+  // Skipped for the subtitles-only path (`skipGeometry`): geometry positions
+  // effects but never touches timing, so the empty probe just degrades every
+  // effect to the authored-box calc — irrelevant when no video/frames are
+  // emitted — while saving an off-screen React render per slide.
+  const geometryBySceneElement = new Map<string, Map<string, MeasuredGeometry>>();
+  for (const scene of scenes) {
+    if (skipGeometry) break;
+    if (scene.type !== 'slide') continue;
+    const targetIds = new Set<string>();
+    for (const action of scene.actions ?? []) {
+      if (action.type === 'spotlight') targetIds.add((action as SpotlightAction).elementId);
+      else if (action.type === 'laser') targetIds.add((action as LaserAction).elementId);
+      else if (action.type === 'play_video') targetIds.add((action as PlayVideoAction).elementId);
+    }
+    if (targetIds.size === 0) continue;
+    const slide = (scene.content as SlideContent)?.canvas;
+    if (!slide) continue;
+    try {
+      const measured = await measureSlideElementGeometry(slide, [...targetIds]);
+      if (measured.size > 0) geometryBySceneElement.set(scene.id, measured);
+    } catch {
+      // A measurement failure degrades to the compiler's authored-box calc — the
+      // effect still renders, just at the pre-#867 position. Never fail export.
+    }
+  }
+
+  const geometry: GeometryProbe = {
+    contentGeometry(elementId: string, scene: SceneCore) {
+      return geometryBySceneElement.get(scene.id)?.get(elementId) ?? null;
     },
   };
 
   return {
     timing,
     assets,
-    records: { audioById, mediaByElementId, videoDurationMsByElementId },
+    geometry,
+    interactive: interactiveHtml,
+    records: { audioById, mediaByElementId, videoDurationMsByElementId, interactiveHtml },
   };
 }

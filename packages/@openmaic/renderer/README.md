@@ -2,7 +2,20 @@
 
 React component for rendering PPTist-style `Slide` JSON. Extracted from [OpenMAIC](https://github.com/THU-MAIC/OpenMAIC).
 
-> **v1 = read-only canvas.** Editing (selection, drag/resize, ProseMirror inline editor) is planned for v2.
+> `@openmaic/renderer` is the read-only canvas package. Editing lives in the
+> separate `@openmaic/editor` package, which depends on this renderer.
+
+## Migrating from 0.0.x
+
+Version `0.1.0` removes the experimental `@openmaic/renderer/editing` subpath.
+Install `@openmaic/editor` and migrate editing imports to its explicit layers:
+
+```ts
+import { EditableSlideCanvas } from '@openmaic/editor/react';
+import { EditableSlideCanvasWithUI } from '@openmaic/editor/ui';
+```
+
+Read-only rendering imports from `@openmaic/renderer` are unchanged.
 
 ## Install
 
@@ -71,21 +84,37 @@ The canvas auto-fits its parent container. The parent must have a defined `width
 
 ### `<SlideCanvas slide effects? renderImage? renderVideo? onElementClick? scale? background? />`
 
-The main read-only entry. Reads everything from props; zero global state.
+The main read-only entry. Reads slide data and rendering options from props.
 
 ```ts
 interface SlideCanvasProps {
   slide?: Slide;                       // required unless via <SlideRendererProvider>
   scale?: number;                      // omit = auto-fit container
+  canvasPercentage?: number;           // percent of the parent used by auto-fit
+  onScaleChange?: (scale) => void;     // computed auto-fit scale
   background?: SlideBackground;        // overrides slide.background
   effects?: SlideEffects;              // laser / spotlight / highlight / zoom, all default off
-  renderImage?: (el, src) => ReactNode;
+  renderImage?: (el, src, defaultContent) => ReactNode;
   renderVideo?: (el) => ReactNode;
+  videoInteractive?: boolean;           // defaults true; set false to disable video pointer interaction
+  mathPriority?: 'normal' | 'background'; // defaults normal; use background for thumbnails
   onElementClick?: (el, event) => void;
+  elementIdPrefix?: string;
   className?: string;
   style?: CSSProperties;
 }
 ```
+
+Inline formulas share a 256,000-character markup budget so oversized slides can
+yield between batches while dense ordinary slides still fit before paint.
+A short formula following heavy content in the same frame may also be deferred.
+Use `mathPriority="background"` for thumbnails: newly mounted or changed content
+shares a copy of the frame's remaining allowance after foreground layout effects,
+before paint. This leaves foreground capacity available if the user switches slides
+after thumbnails mount in the same frame; that frame may use both allowances.
+Remaining formulas render in idle time after foreground canvases; unrelated
+parent rerenders do not advance that queued work. Snapshot APIs still finish all
+formulas synchronously within the existing per-prose-root hard caps.
 
 ### Play-time effects
 
@@ -110,13 +139,17 @@ The package's `BaseImageElement` and `BaseVideoElement` render plain `<img>` / `
 ```tsx
 <SlideCanvas
   slide={slide}
-  renderImage={(el, src) => (
+  renderImage={(el, src, defaultContent) => (
     src.startsWith('placeholder:')
       ? <MyPlaceholder taskId={src} />
-      : <img src={resolveCdnUrl(src)} alt="" style={{ width: '100%', height: '100%' }} />
+      : defaultContent
   )}
 />
 ```
+
+`defaultContent` is the renderer-prepared image, including clipping, filters,
+soft edges, and `colorMask`. The slot return value is authoritative: return
+`null` to intentionally hide the image.
 
 ### `<SlideRendererProvider>` + `useSlideContext()`
 
@@ -215,3 +248,10 @@ import '@openmaic/renderer/fonts.css';
 ## License
 
 MIT
+
+## Geometry without rendering
+
+Import `getElementRange` and `getLineElementPath` from `@openmaic/renderer/geometry`
+to reuse the renderer's geometry in Node or server-side document operations without
+loading React components. Line ranges include endpoint minima and active control
+points; curves use a conservative control hull.

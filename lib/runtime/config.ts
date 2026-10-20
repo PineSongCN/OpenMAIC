@@ -18,8 +18,9 @@ let resolutionStarted = false;
  * bootstrap, before rendering any runtime consumer; a component effect is too
  * late. A second call always throws, even if runtime storage has not been used
  * yet. Once resolution has started, configuration stays sealed so a live app
- * cannot split data across backends or learner partitions. Omitted fields
- * retain the browser IndexedDB backend and anonymous device-key behavior.
+ * cannot split data across backends or learner partitions. The browser
+ * persistence bootstrap (`lib/persistence/bootstrap.ts`) is the production
+ * caller; without a configured store, runtime storage does not resolve.
  *
  * A store factory is called lazily by `getRuntimeStore()` until it first
  * succeeds. The configured learner-key provider is invoked only on first
@@ -40,6 +41,17 @@ let resolutionStarted = false;
  * ```
  */
 export function configureRuntimeStorage(next: RuntimeStorageOptions): void {
+  assertRuntimeStorageConfigurable();
+  // Snapshot: a caller mutating its options object after configuring must not
+  // be able to swap the backend or identity behind the sealed configuration.
+  options = { store: next.store, learnerKey: next.learnerKey };
+}
+
+/**
+ * @internal Synchronous bootstrap preflight used to make multi-seam
+ * configuration atomic.
+ */
+export function assertRuntimeStorageConfigurable(): void {
   if (resolutionStarted) {
     throw new Error(
       'configureRuntimeStorage must be called at module-level bootstrap, before any runtime consumer runs — a component effect is too late. Runtime storage resolution has already started; configuration remains sealed even if resolution failed. Retry the runtime consumer to retry resolution.',
@@ -48,9 +60,6 @@ export function configureRuntimeStorage(next: RuntimeStorageOptions): void {
   if (options) {
     throw new Error('Runtime storage has already been configured');
   }
-  // Snapshot: a caller mutating its options object after configuring must not
-  // be able to swap the backend or identity behind the sealed configuration.
-  options = { store: next.store, learnerKey: next.learnerKey };
 }
 
 /** Whether client bootstrap has supplied runtime storage configuration. */

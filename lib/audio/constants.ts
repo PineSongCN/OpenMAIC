@@ -36,6 +36,7 @@ import type {
   ASRProviderId,
   ASRProviderConfig,
 } from './types';
+import { isCustomTTSProvider } from './types';
 import {
   VOXCPM_AUTO_VOICE,
   VOXCPM_AUTO_VOICE_ID,
@@ -77,6 +78,59 @@ export const MINIMAX_TTS_MODELS = [
   { id: 'speech-02-hd', name: 'Speech 02 HD' },
   { id: 'speech-02-turbo', name: 'Speech 02 Turbo' },
 ] as const;
+
+// Legacy sentinel for saved clone voices, excluded from manual model pickers.
+// Keep voice-driven dispatch compatible until the replacement protocol is supported.
+export const DEFAULT_QWEN_TTS_VOICE_CLONE_MODEL = 'qwen3-tts-vc-2026-01-22';
+/** Client-visible VC model. Server-only overrides are resolved in provider-config. */
+export const QWEN_TTS_VOICE_CLONE_MODEL = DEFAULT_QWEN_TTS_VOICE_CLONE_MODEL;
+
+export function isQwenVoiceCloneModel(modelId?: string, configuredModelId?: string): boolean {
+  return (
+    !!modelId &&
+    (/-tts-vc(?:-|$)/iu.test(modelId) || (!!configuredModelId && modelId === configuredModelId))
+  );
+}
+
+/** A Qwen catalog voice is provider-owned and must never use the clone model. */
+export function isQwenCatalogVoice(voiceId?: string): boolean {
+  return !!voiceId && TTS_PROVIDERS['qwen-tts'].voices.some((voice) => voice.id === voiceId);
+}
+
+/** A non-catalog Qwen voice ID is an enrolled clone; local profile storage is not authoritative. */
+export function isQwenCloneVoice(voiceId?: string): boolean {
+  return !!voiceId && !isQwenCatalogVoice(voiceId);
+}
+
+/**
+ * Enforce the client-side half of the model-follows-voice invariant. The server
+ * maps the VC sentinel to its operator-resolved model and applies model pins.
+ */
+export function resolveTTSModelForVoice(
+  providerId: TTSProviderId,
+  voiceId: string,
+  requestedModelId?: string,
+): string | undefined {
+  if (providerId !== 'qwen-tts') return requestedModelId;
+  if (isQwenCloneVoice(voiceId)) return QWEN_TTS_VOICE_CLONE_MODEL;
+  return requestedModelId && !isQwenVoiceCloneModel(requestedModelId)
+    ? requestedModelId
+    : TTS_PROVIDERS['qwen-tts'].defaultModelId;
+}
+
+/**
+ * Whether a model can speak a voice: a catalogue voice that lists compatible
+ * models (OpenAI's Marin and Cedar need gpt-4o-mini-tts) only on those; any
+ * other voice (no such list, a clone, a user voice) on any model. Without a
+ * model the provider's default model is meant.
+ */
+export function voiceServesModel(providerId: string, voiceId: string, modelId?: string): boolean {
+  const provider = TTS_PROVIDERS[providerId as BuiltInTTSProviderId];
+  const voice = provider?.voices.find((entry) => entry.id === voiceId);
+  if (!voice?.compatibleModels) return true;
+  const model = modelId || provider.defaultModelId;
+  return !!model && voice.compatibleModels.includes(model);
+}
 
 export const TTS_PROVIDERS: Record<BuiltInTTSProviderId, TTSProviderConfig> = {
   'openai-tts': {
@@ -306,10 +360,14 @@ export const TTS_PROVIDERS: Record<BuiltInTTSProviderId, TTSProviderConfig> = {
     requiresApiKey: true,
     defaultBaseUrl: 'https://dashscope.aliyuncs.com/api/v1',
     icon: '/logos/bailian.svg',
+    // Paid showcase presets: never offered to the agent even when this provider
+    // is configured (explicit mechanism, not "no env so absent"). A clone
+    // registered this session through the registration adapter stays bindable;
+    // only the preset list is excluded from the agent catalog.
+    excludeFromAgentVoiceCatalog: true,
     models: [
       { id: 'qwen3-tts-flash', name: 'Qwen3 TTS Flash' },
-      { id: 'qwen3-tts-instruct-flash', name: 'Qwen3 TTS Instruct Flash' },
-      { id: 'qwen-tts', name: 'Qwen TTS' },
+      { id: QWEN_TTS_VOICE_CLONE_MODEL, name: 'Qwen3 TTS Voice Clone' },
     ],
     defaultModelId: 'qwen3-tts-flash',
     voices: [
@@ -928,6 +986,199 @@ export const TTS_PROVIDERS: Record<BuiltInTTSProviderId, TTSProviderConfig> = {
     speedRange: { min: 0.7, max: 1.2, default: 1.0 },
   },
 
+  'google-tts': {
+    id: 'google-tts',
+    name: 'Google Gemini TTS',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    icon: '/logos/gemini.svg',
+    models: [
+      { id: 'gemini-3.1-flash-tts-preview', name: 'Gemini 3.1 Flash TTS Preview' },
+      { id: 'gemini-2.5-flash-preview-tts', name: 'Gemini 2.5 Flash Preview TTS' },
+      { id: 'gemini-2.5-pro-preview-tts', name: 'Gemini 2.5 Pro Preview TTS' },
+    ],
+    defaultModelId: 'gemini-3.1-flash-tts-preview',
+    // Prebuilt Gemini TTS voices (https://ai.google.dev/gemini-api/docs/speech-generation)
+    voices: [
+      { id: 'Zephyr', name: 'Zephyr', language: 'en-US', gender: 'neutral', description: 'Bright' },
+      { id: 'Puck', name: 'Puck', language: 'en-US', gender: 'neutral', description: 'Upbeat' },
+      {
+        id: 'Charon',
+        name: 'Charon',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Informative',
+      },
+      { id: 'Kore', name: 'Kore', language: 'en-US', gender: 'neutral', description: 'Firm' },
+      {
+        id: 'Fenrir',
+        name: 'Fenrir',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Excitable',
+      },
+      { id: 'Leda', name: 'Leda', language: 'en-US', gender: 'neutral', description: 'Youthful' },
+      { id: 'Orus', name: 'Orus', language: 'en-US', gender: 'neutral', description: 'Firm' },
+      { id: 'Aoede', name: 'Aoede', language: 'en-US', gender: 'neutral', description: 'Breezy' },
+      {
+        id: 'Callirrhoe',
+        name: 'Callirrhoe',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Easy-going',
+      },
+      {
+        id: 'Autonoe',
+        name: 'Autonoe',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Bright',
+      },
+      {
+        id: 'Enceladus',
+        name: 'Enceladus',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Breathy',
+      },
+      {
+        id: 'Iapetus',
+        name: 'Iapetus',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Clear',
+      },
+      {
+        id: 'Umbriel',
+        name: 'Umbriel',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Easy-going',
+      },
+      {
+        id: 'Algieba',
+        name: 'Algieba',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Smooth',
+      },
+      {
+        id: 'Despina',
+        name: 'Despina',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Smooth',
+      },
+      {
+        id: 'Erinome',
+        name: 'Erinome',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Clear',
+      },
+      {
+        id: 'Algenib',
+        name: 'Algenib',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Gravelly',
+      },
+      {
+        id: 'Rasalgethi',
+        name: 'Rasalgethi',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Informative',
+      },
+      {
+        id: 'Laomedeia',
+        name: 'Laomedeia',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Upbeat',
+      },
+      {
+        id: 'Achernar',
+        name: 'Achernar',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Soft',
+      },
+      {
+        id: 'Alnilam',
+        name: 'Alnilam',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Firm',
+      },
+      {
+        id: 'Schedar',
+        name: 'Schedar',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Even',
+      },
+      {
+        id: 'Gacrux',
+        name: 'Gacrux',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Mature',
+      },
+      {
+        id: 'Pulcherrima',
+        name: 'Pulcherrima',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Forward',
+      },
+      {
+        id: 'Achird',
+        name: 'Achird',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Friendly',
+      },
+      {
+        id: 'Zubenelgenubi',
+        name: 'Zubenelgenubi',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Casual',
+      },
+      {
+        id: 'Vindemiatrix',
+        name: 'Vindemiatrix',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Gentle',
+      },
+      {
+        id: 'Sadachbia',
+        name: 'Sadachbia',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Lively',
+      },
+      {
+        id: 'Sadaltager',
+        name: 'Sadaltager',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Knowledgeable',
+      },
+      {
+        id: 'Sulafat',
+        name: 'Sulafat',
+        language: 'en-US',
+        gender: 'neutral',
+        description: 'Warm',
+      },
+    ],
+    supportedFormats: ['wav'],
+    supportsSpeed: false,
+  },
+
   'browser-native-tts': {
     id: 'browser-native-tts',
     name: '浏览器原生 (Web Speech API)',
@@ -1249,6 +1500,22 @@ export const ASR_PROVIDERS: Record<BuiltInASRProviderId, ASRProviderConfig> = {
     supportedFormats: ['webm'], // MediaRecorder format
   },
 
+  'funasr-asr': {
+    id: 'funasr-asr',
+    name: 'FunASR',
+    requiresApiKey: false,
+    defaultBaseUrl: 'http://localhost:8000/v1',
+    icon: '/logos/funasr.png',
+    models: [
+      { id: 'sensevoice', name: 'SenseVoiceSmall' },
+      { id: 'paraformer', name: 'Paraformer' },
+      { id: 'fun-asr-nano', name: 'Fun-ASR-Nano' },
+    ],
+    defaultModelId: 'sensevoice',
+    supportedLanguages: ['auto', 'zh', 'en', 'ja', 'ko', 'yue'],
+    supportedFormats: ['wav'],
+  },
+
   'lemonade-asr': {
     id: 'lemonade-asr',
     name: 'Lemonade ASR',
@@ -1282,6 +1549,7 @@ export const DEFAULT_TTS_VOICES: Record<BuiltInTTSProviderId, string> = {
   'doubao-tts': 'zh_female_vv_uranus_bigtts',
   'elevenlabs-tts': 'EXAVITQu4vr4xnSDxMaL',
   'minimax-tts': 'female-yujie',
+  'google-tts': 'Kore',
   'lemonade-tts': 'af_heart',
   'browser-native-tts': 'default',
 };
@@ -1295,6 +1563,7 @@ export const DEFAULT_TTS_MODELS: Record<BuiltInTTSProviderId, string> = {
   'doubao-tts': '',
   'elevenlabs-tts': 'eleven_multilingual_v2',
   'minimax-tts': 'speech-2.8-hd',
+  'google-tts': 'gemini-3.1-flash-tts-preview',
   'lemonade-tts': 'kokoro-v1',
   'browser-native-tts': '',
 };
@@ -1311,16 +1580,42 @@ export function getAllTTSProviders(
 }
 
 /**
+ * Narrow an arbitrary string (e.g. from a persisted document or an imported
+ * manifest, where the contract keeps providerId an open string) to a known
+ * TTS provider id: a registered built-in provider or the user-defined
+ * custom-provider namespace. Anything else must be treated as "no voice".
+ */
+export function isKnownTTSProviderId(id: string): id is TTSProviderId {
+  // Object.hasOwn, not `in`: prototype-chain keys ('toString', 'constructor',
+  // …) must not pass a whitelist built from an object literal.
+  return Object.hasOwn(TTS_PROVIDERS, id) || isCustomTTSProvider(id);
+}
+
+/**
  * Get TTS provider by ID (checks built-in first, then custom)
  */
 export function getTTSProvider(
   providerId: TTSProviderId,
   customProviders?: Record<string, TTSProviderConfig>,
 ): TTSProviderConfig | undefined {
-  if (providerId in TTS_PROVIDERS) {
+  if (Object.hasOwn(TTS_PROVIDERS, providerId)) {
     return TTS_PROVIDERS[providerId as BuiltInTTSProviderId];
   }
   return customProviders?.[providerId];
+}
+
+/**
+ * Models a user may pick manually in the UI. The Qwen voice-clone model is
+ * excluded: it is never chosen by hand, only resolved implicitly from a picked
+ * clone voice (model-follows-voice), so it must not appear in manual model
+ * pickers while staying in the provider registry for voice-driven dispatch.
+ */
+export function getManuallySelectableTTSModels(
+  providerId: TTSProviderId,
+  customProviders?: Record<string, TTSProviderConfig>,
+): TTSProviderConfig['models'] {
+  const provider = getTTSProvider(providerId, customProviders);
+  return (provider?.models || []).filter((model) => !isQwenVoiceCloneModel(model.id));
 }
 
 /**
@@ -1351,7 +1646,7 @@ export function getASRProvider(
   providerId: ASRProviderId,
   customProviders?: Record<string, ASRProviderConfig>,
 ): ASRProviderConfig | undefined {
-  if (providerId in ASR_PROVIDERS) {
+  if (Object.hasOwn(ASR_PROVIDERS, providerId)) {
     return ASR_PROVIDERS[providerId as BuiltInASRProviderId];
   }
   return customProviders?.[providerId];

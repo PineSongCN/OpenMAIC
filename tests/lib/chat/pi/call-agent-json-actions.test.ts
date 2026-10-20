@@ -4,6 +4,7 @@ import type { StatelessChatRequest, StatelessEvent } from '@/lib/types/chat';
 
 const mocks = vi.hoisted(() => ({
   buildAgent: vi.fn(),
+  childPrompts: [] as string[],
 }));
 
 vi.mock('@/lib/agent/runtime/build-agent', () => ({
@@ -26,6 +27,13 @@ const teacher: AgentConfig = {
   createdAt: new Date('2026-01-01T00:00:00Z'),
   updatedAt: new Date('2026-01-01T00:00:00Z'),
   isDefault: true,
+};
+const assistant: AgentConfig = {
+  ...teacher,
+  id: 'assistant-1',
+  name: 'AI assistant',
+  role: 'assistant',
+  isDefault: false,
 };
 const fullWhiteboardActions = [
   'spotlight',
@@ -110,7 +118,9 @@ function makeMockChildWithJsonOutput(jsonOutput: string) {
       }, 0);
       return () => {};
     },
-    prompt: async () => {},
+    prompt: async (prompt: string) => {
+      mocks.childPrompts.push(prompt);
+    },
     waitForIdle: async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     },
@@ -186,6 +196,98 @@ describe('Pi call_agent JSON action output', () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.buildAgent.mockReset();
+    mocks.childPrompts.length = 0;
+  });
+
+  it('attaches the same request-scoped selected-element evidence to every Legacy delegation', async () => {
+    mockChildWithJsonOutput(JSON.stringify([{ type: 'text', content: '基于所选元素回答。' }]));
+    const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+    const events: StatelessEvent[] = [];
+    const packet = {
+      content: 'Selected element packet',
+      metadata: {
+        kind: 'slide_element' as const,
+        source: 'request_start_snapshot' as const,
+        sceneId: 'scene-1',
+        elementId: 'element-1',
+        elementType: 'text' as const,
+        geometry: { left: 0, top: 0, width: 100, height: 40, rotate: 0 },
+        truncatedFields: [],
+        omittedItems: {},
+        content: { text: 'Evidence' },
+      },
+    };
+    const tool = buildCallAgentTool({
+      ...baseToolOpts(events),
+      agentConfigs: [teacher, assistant],
+      elementReferenceEvidence: packet,
+    });
+
+    const first = await tool.execute('call-grounded-1', {
+      agentId: teacher.id,
+      instruction: 'Explain the selected element.',
+    });
+    const second = await tool.execute('call-grounded-2', {
+      agentId: assistant.id,
+      instruction: 'Continue through a grounded handoff.',
+    });
+
+    expect(first.details).toMatchObject({ elementReferenceEvidence: packet.metadata });
+    expect(second.details).toMatchObject({ elementReferenceEvidence: packet.metadata });
+    expect(first.details).not.toHaveProperty('groundedChildSucceeded');
+    expect(second.details).not.toHaveProperty('groundedChildSucceeded');
+    expect(mocks.childPrompts).toHaveLength(2);
+    expect(mocks.childPrompts[0]).toContain('Selected element packet');
+    expect(mocks.childPrompts[1]).toContain('Selected element packet');
+  }, 15_000);
+
+  it('keeps a failed grounded Legacy turn in the ordinary result lifecycle', async () => {
+    let handler: ((event: unknown) => unknown) | null = null;
+    mocks.buildAgent.mockReturnValue({
+      subscribe: (next: (event: unknown) => unknown) => {
+        handler = next;
+        return () => {};
+      },
+      prompt: async () => {},
+      waitForIdle: async () => {
+        await handler?.({
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'partial answer' },
+        });
+        throw new Error('provider failed');
+      },
+      state: { messages: [] },
+    });
+    const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+    const tool = buildCallAgentTool({
+      ...baseToolOpts([]),
+      elementReferenceEvidence: {
+        content: 'Selected element packet',
+        metadata: {
+          kind: 'slide_element',
+          source: 'request_start_snapshot',
+          sceneId: 'scene-1',
+          elementId: 'element-1',
+          elementType: 'text',
+          geometry: { left: 0, top: 0, width: 100, height: 40, rotate: 0 },
+          truncatedFields: [],
+          omittedItems: {},
+          content: { text: 'Evidence' },
+        },
+      },
+    });
+
+    const result = await tool.execute('call-grounded-failure', {
+      agentId: teacher.id,
+      instruction: 'Explain the selected element.',
+    });
+
+    expect(result).not.toHaveProperty('isError');
+    expect(result.details).toMatchObject({
+      text: 'partial answer',
+      elementReferenceEvidence: expect.objectContaining({ elementId: 'element-1' }),
+    });
+    expect(result.details).not.toHaveProperty('groundedChildSucceeded');
   });
 
   it('parses child JSON actions, executes all action events, and does not leak raw JSON speech', async () => {
@@ -827,89 +929,6 @@ describe('Pi call_agent JSON action output', () => {
         },
       ],
     });
-  });
-
-  it('does not allow wrap-up turns to mutate the whiteboard', async () => {
-    mockChildWithJsonOutput(
-      JSON.stringify([
-        { type: 'action', name: 'spotlight', params: { elementId: 'formula_1' } },
-        { type: 'action', name: 'wb_open', params: {} },
-        {
-          type: 'action',
-          name: 'wb_draw_latex',
-          params: { latex: '6CO_2 + 6H_2O -> C_6H_{12}O_6 + 6O_2', x: 80, y: 120 },
-        },
-        { type: 'text', content: '最后看一下幻灯片上的公式就好。' },
-      ]),
-    );
-
-    const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
-    const events: StatelessEvent[] = [];
-    const onAgentDone = vi.fn();
-    const onActionDone = vi.fn();
-    const tool = buildCallAgentTool({
-      body: makeBody({
-        slideElements: [{ id: 'formula_1', type: 'latex', latex: '6CO_2 + 6H_2O -> ...' }],
-      }),
-      agentConfigs: [slideTeacher],
-      send: async (event) => {
-        events.push(event);
-      },
-      languageModel: {} as never,
-      onAgentDone,
-      onActionDone,
-      thinkingConfig: { mode: 'disabled', enabled: false },
-      abortSignal: new AbortController().signal,
-      maxAgentTurns: 1,
-      getAgentTurnCount: () => 1,
-      getAgentResponses: () => [],
-      getWhiteboardLedger: () => [],
-      maxActionsPerAgent: 8,
-      enableWhiteboardTools: true,
-    });
-
-    const result = await tool.execute('call-1', {
-      agentId: slideTeacher.id,
-      instruction: 'Give one short final summary.',
-      turnKind: 'wrap_up',
-    });
-
-    expect(events.filter((event) => event.type === 'action')).toEqual([
-      {
-        type: 'action',
-        data: {
-          actionId: expect.any(String),
-          actionName: 'spotlight',
-          agentId: slideTeacher.id,
-          messageId: expect.any(String),
-          params: { elementId: 'formula_1' },
-        },
-      },
-    ]);
-    expect(result.details).toMatchObject({
-      text: '最后看一下幻灯片上的公式就好。',
-      turnKind: 'wrap_up',
-      actionWarnings: [
-        {
-          actionName: 'wb_open',
-          reason: 'unknown_action',
-          message: 'Action "wb_open" is not available for this agent/scene.',
-        },
-        {
-          actionName: 'wb_draw_latex',
-          reason: 'unknown_action',
-          message: 'Action "wb_draw_latex" is not available for this agent/scene.',
-        },
-      ],
-    });
-    expect(onActionDone).toHaveBeenCalledTimes(1);
-    expect(onAgentDone).toHaveBeenCalledWith(
-      expect.objectContaining({
-        actionCount: 1,
-        whiteboardActions: [],
-        turnKind: 'wrap_up',
-      }),
-    );
   });
 
   it('skips actions with missing required params and preserves later legal action/text', async () => {

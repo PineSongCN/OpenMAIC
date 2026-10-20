@@ -1,42 +1,55 @@
-import { BrowserDocumentStore, type DocumentStore } from '@openmaic/storage';
+import '@/lib/persistence/bootstrap';
+
+import type { DocumentStore } from '@openmaic/storage';
 
 import type { AppScene } from '@/lib/types/stage';
 
+import { registerDocumentStorageResetHook, resolveConfiguredDocumentStore } from './config';
 import type { AppStage } from './persistence-types';
-import { validateAppScene, validateAppStage } from './validators';
+import {
+  resetPlainJsonDocumentWritesForTests,
+  withPlainJsonDocumentWrites,
+} from './plain-json-store';
 
-const DOCUMENT_DB_NAME = 'maic-documents';
+export {
+  configureDocumentStorage,
+  isDocumentStorageConfigured,
+  resetDocumentStorageForTests,
+} from './config';
+export type {
+  DocumentStorageOptions,
+  DocumentStorageValidators,
+  DocumentStoreFactory,
+} from './config';
 
 export interface DocumentStoreDeps {
-  /** A complete store override takes precedence over browser construction. */
+  /** A complete store override (tests, server-side callers). */
   store?: DocumentStore<AppScene, AppStage>;
-  /** IndexedDB factory for isolated browser tests. */
-  indexedDB?: IDBFactory;
-  /** Database name override for isolated browser tests. */
-  dbName?: string;
 }
 
 let defaultStore: DocumentStore<AppScene, AppStage> | undefined;
 
-function createBrowserStore(
-  deps: Omit<DocumentStoreDeps, 'store'>,
-): DocumentStore<AppScene, AppStage> {
-  // Capability probe, not an environment probe: node test runners inject a
-  // fake `indexedDB` global; a true server render has neither and must throw.
-  if (!deps.indexedDB && typeof indexedDB === 'undefined') {
-    throw new Error('Document persistence requires IndexedDB (client-only)');
-  }
-  return new BrowserDocumentStore<AppScene, AppStage>({
-    indexedDB: deps.indexedDB,
-    dbName: deps.dbName ?? DOCUMENT_DB_NAME,
-    validateScene: validateAppScene,
-    validateStage: validateAppStage,
-  });
-}
+registerDocumentStorageResetHook(() => {
+  defaultStore = undefined;
+  resetPlainJsonDocumentWritesForTests();
+});
 
-/** Resolve the app document store without opening IndexedDB at module import. */
+/**
+ * Resolve the app document store: the server-backed store the browser
+ * persistence bootstrap configures. There is no browser-storage backend; a
+ * caller outside the browser (a server render, a test) must inject its own.
+ */
 export function getDocumentStore(deps: DocumentStoreDeps = {}): DocumentStore<AppScene, AppStage> {
-  if (deps.store) return deps.store;
-  if (deps.indexedDB || deps.dbName) return createBrowserStore(deps);
-  return (defaultStore ??= createBrowserStore({}));
+  if (deps.store) return withPlainJsonDocumentWrites(deps.store);
+  // `??=` assigns only after resolution succeeds: if a configured factory
+  // throws, the next call retries it rather than caching the failure.
+  return (defaultStore ??= (() => {
+    const configured = resolveConfiguredDocumentStore();
+    if (!configured) {
+      throw new Error(
+        'Document storage is not configured: the browser persistence bootstrap configures it, and code outside the browser must inject a store',
+      );
+    }
+    return withPlainJsonDocumentWrites(configured);
+  })());
 }

@@ -1,15 +1,15 @@
 ---
-title: Getting Started
-description: Install OpenMAIC and run it locally in five minutes.
+title: Getting started
+description: Run OpenMAIC locally in five minutes.
 ---
 
-OpenMAIC is a Next.js application you can run on your own machine. You need Node.js, pnpm, and at least one LLM API key.
+OpenMAIC is a Next.js application that runs on your own machine. You need to configure at least one LLM provider: cloud providers usually require an API key, while local Ollama or Lemonade does not.
 
 ## Prerequisites
 
-- **Node.js** 20 or later
-- **pnpm** 10 or later (install with `npm install -g pnpm` if needed)
-- An API key from at least one LLM provider — OpenAI, Anthropic, Google, DeepSeek, Zhipu, MiniMax, Qwen, Doubao, Groq, SiliconFlow, or Ollama (local)
+- **Node.js** 22.19.0 or later
+- **pnpm** 10.28.0 (if needed, run `npm install -g pnpm@10.28.0`)
+- At least one LLM provider; cloud providers usually require an API key, while local Ollama or Lemonade does not
 
 ## Install
 
@@ -21,74 +21,87 @@ cd OpenMAIC
 pnpm install
 ```
 
-The install step also builds the two workspace packages (`mathml2omml` and `pptxgenjs`). This takes a minute on first run.
+Installation builds the workspace packages required by the project, so the first install may take some time.
 
 ## Configure
 
-Copy the sample env file and fill in at least one LLM provider:
+Copy the example environment file and configure at least one LLM provider:
 
 ```bash
 cp .env.example .env.local
 ```
 
-Open `.env.local` and set whichever providers you have keys for. For example:
+Then configure a model. The simplest file setup is a minimal `openmaic.yml` next to `.env.local`, with the key in `.env.local`:
 
 ```bash title=".env.local"
 OPENAI_API_KEY=sk-...
-# or
-ANTHROPIC_API_KEY=sk-ant-...
-# or local Ollama (no key needed)
-OLLAMA_BASE_URL=http://localhost:11434/v1
 ```
 
-See [Configuration](./configuration.mdx) for the full list of providers, TTS, ASR, and feature flags.
+```yaml title="openmaic.yml"
+providers:
+  openai:
+    preset: openai
+    apiKey: ${OPENAI_API_KEY}
+
+slots:
+  llm: openai:gpt-5.5
+```
+
+`openmaic.example.yml` is this same starting point, with optional providers and slots commented out. Without the file, the legacy provider variables still work as long as `DEFAULT_MODEL` names the model:
+
+```bash title=".env.local"
+ANTHROPIC_API_KEY=sk-ant-...
+DEFAULT_MODEL=anthropic:claude-sonnet-4-6
+```
+
+To skip both, start the app and enter a plan's key in **Settings → Token Plan**, or a service's key in **Settings → Model Services**. Without `openmaic.yml`, `DEFAULT_MODEL` or a service set up there, no model is configured and generation fails.
+
+See [Configuration](./configuration.mdx) for complete provider, image/video generation, TTS, ASR, document parsing, web search, access control, and feature flag configuration.
 
 ## Run
 
-Start the dev server:
+Courses are stored in PostgreSQL, and the server refuses to start without `DATABASE_URL`. Start a local development database (a separate PostgreSQL in Docker on `127.0.0.1:5432`, shared by every checkout on this machine; set `OPENMAIC_DB_PORT` for another port) and set `DATABASE_URL` in `.env.local`:
+
+```bash
+pnpm db:up
+```
+
+```bash title=".env.local"
+DATABASE_URL=postgres://openmaic:openmaic-dev@127.0.0.1:5432/openmaic
+```
+
+Start the development server:
 
 ```bash
 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). You should see the OpenMAIC classroom generator. Drop a topic or PDF, click Generate, and watch an AI teacher build a full multi-scene classroom.
+Open [http://localhost:3000](http://localhost:3000). You should see the OpenMAIC classroom generator. Enter a topic or upload learning material, then click Generate; the AI teachers will build a complete, multi-scene classroom. Supported material formats depend on the selected parser and typically include PDF, Office documents, Markdown/plain text, images, and some audio/video formats. Consult the parser's supported formats for the exact range.
 
-## Troubleshooting
+## Export a classroom
 
-### Dev server crashes when generating large content
+Once a classroom and its media have finished generating, the download button at the top right of the classroom opens the export menu:
 
-If the dev server dies while generating a large classroom (for example from a long multi-chapter outline) with an error like:
+- **Export PPTX**: editable slides. **With placeholder slides (recommended)** keeps interactive, quiz and project-based learning scenes where they are in the lesson, each as a slide with an **Open online** button and a QR code that open the scene in the online classroom. **Slides only** leaves those scenes out.
+- **Export Resource Pack**: the same PPTX choice, plus each interactive scene as a self-contained web page.
+- **Export as HTML**: one self-contained file that plays the classroom without a network connection, with narration and captions, spotlight and laser, slide video, discussion cards and interactive scenes. Quiz, interactive and project scenes wait until the learner moves on. A project-based learning scene keeps only its briefing (goal and milestones); continuing the project needs the online classroom and a network connection. If the export reports assets it couldn't bundle, those parts of interactive scenes don't show in the offline HTML; they are still available in the online classroom. **With narration and video** plays like the classroom; **Without narration** makes a smaller file that paces the captions by reading time and leaves videos out.
+- **Export Classroom ZIP**: the course structure and media, to back the classroom up or import it on another OpenMAIC deployment.
 
-```
-Jest worker encountered 2 child process exceptions, exceeding retry limit
-```
+A classroom that would exceed 400 MB as one HTML file is saved as a ZIP instead: extract the whole ZIP and open `classroom.html`, keeping the `audio/`, `media/` and `images/` folders next to it.
 
-this is a dev-only Next.js limitation, not a bug in OpenMAIC's runtime. In dev mode, Next forks an internal worker process for App Router dynamic routes (such as `/classroom/[id]`); when a large generation holds a big in-memory object as that worker is forked, the worker can be OOM-killed and take the dev server down with it. The "Jest worker" name is just Next's internal process pool and is unrelated to testing.
-
-Raise the dev heap limit, sized to your machine's RAM (don't over-set it past available memory or you trade a V8 OOM for a system-level one):
-
-```bash
-# macOS / Linux
-NODE_OPTIONS=--max-old-space-size=4096 pnpm dev
-
-# Windows (PowerShell)
-$env:NODE_OPTIONS="--max-old-space-size=4096"; pnpm dev
-```
-
-Production builds are unaffected — they are prebuilt and never fork this worker.
+The exported HTML file needs a web browser with JavaScript. On a phone, open it in a browser such as Safari or Chrome: on iPhone it does not play inside WeChat or the Files preview.
 
 ## Build for production
 
 ```bash
 pnpm build
-pnpm start
+DATABASE_URL=postgres://... pnpm start
 ```
 
-Or deploy to Vercel, Docker, or your own server — see [Deployment](./deployment.mdx).
+Or deploy with Docker or on your own server—see the [Deployment guide](./deployment.mdx).
 
 ## Next steps
 
 - [Configure providers, TTS, and ACCESS_CODE →](./configuration.mdx)
-- [Deploy to Vercel or Docker →](./deployment.mdx)
-- Explore the [architecture and contribute on GitHub](https://github.com/THU-MAIC/OpenMAIC#-contributing)
-
+- [Deploy with Docker or on your own server →](./deployment.mdx)
+- For architecture details or contribution guidance, visit [GitHub](https://github.com/THU-MAIC/OpenMAIC#-contributing)

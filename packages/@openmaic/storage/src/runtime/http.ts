@@ -51,12 +51,14 @@ interface RuntimeAppendConflictDetails {
 export class HttpRuntimeStoreError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly details: unknown;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, details?: unknown) {
     super(message);
     this.name = 'HttpRuntimeStoreError';
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -112,6 +114,19 @@ function assertValidRecord<TPayload extends RuntimePayload>(
   );
 }
 
+function assertValidRecordInit<TPayload extends RuntimePayload>(
+  init: RuntimeRecordInit<TPayload>,
+): void {
+  const result = validateRuntimeRecord({ ...init, seq: 0 });
+  if (result.valid) return;
+  const detail = result.errors.map((error) => `${error.path || '/'}: ${error.message}`).join('; ');
+  throw new HttpRuntimeStoreError(
+    400,
+    'VALIDATION_FAILED',
+    `@openmaic/storage: invalid runtime record ${JSON.stringify(init.id)}: ${detail}`,
+  );
+}
+
 function normalizeHeaders(init: HeadersInit | undefined): Record<string, string> {
   const normalized: Record<string, string> = {};
   const set = (name: string, value: string): void => {
@@ -145,10 +160,17 @@ export class HttpRuntimeStore implements RuntimeStore {
     if (options.baseUrl === '') {
       throw new Error('@openmaic/storage: HttpRuntimeStore baseUrl must be non-empty');
     }
-    const fetchImpl = options.fetch ?? globalThis.fetch;
-    if (typeof fetchImpl !== 'function') {
+    // Bind explicitly: browsers require fetch to be invoked with `this === globalThis`
+    // (calling a stored reference as `this.fetchImpl(...)` throws "Illegal
+    // invocation"), while node's undici does not care — which is exactly why
+    // node-only test suites cannot catch the unbound form.
+    // Validate BEFORE binding: .bind on a non-function throws a native
+    // TypeError that would preempt the documented error below.
+    const selectedFetch = options.fetch ?? globalThis.fetch;
+    if (typeof selectedFetch !== 'function') {
       throw new Error('@openmaic/storage: HttpRuntimeStore requires a fetch implementation');
     }
+    const fetchImpl = selectedFetch.bind(globalThis);
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.fetchImpl = fetchImpl;
     this.headersHook = options.headers;
@@ -203,7 +225,7 @@ export class HttpRuntimeStore implements RuntimeStore {
           );
         }
       }
-      throw new HttpRuntimeStoreError(response.status, code, message);
+      throw new HttpRuntimeStoreError(response.status, code, message, errorBody?.error?.details);
     }
     if (response.status === 204) return { body: undefined as T, status: response.status };
     return { body: (await response.json()) as T, status: response.status };
@@ -295,6 +317,7 @@ export class HttpRuntimeStore implements RuntimeStore {
     assertJsonValue(init.payload, `runtime record ${JSON.stringify(init.id)} payload`);
     const normalizedInit = withoutUndefinedAnchors(init);
     assertJsonValue(normalizedInit, `runtime record ${JSON.stringify(init.id)}`);
+    assertValidRecordInit(normalizedInit);
     const body = {
       ...normalizedInit,
       ...(options.expectedLastSeq === undefined

@@ -24,7 +24,40 @@ import type {
   RuntimeStore,
   RuntimeTailOptions,
 } from '../runtime/types.js';
-import { RuntimeAppendConflictError } from '../runtime/types.js';
+import {
+  RuntimeAppendConflictError,
+  RuntimeSessionExistsError,
+  RuntimeStageNotFoundError,
+} from '../runtime/types.js';
+import type { Scene, Stage } from '@openmaic/dsl';
+import type { DocumentStore, SceneLike } from '../document/types.js';
+import type { AssetPrincipal, AssetStore } from '../asset/types.js';
+import { createAssetHttpHandler, type AssetHttpHandlerOptions } from './asset.js';
+import { createDocumentHttpHandler, type DocumentHttpHandlerOptions } from './document.js';
+import { assertMaxBodyBytes, DEFAULT_MAX_BODY_BYTES, readJsonObject } from './read-json.js';
+import { storePolicyResponse } from '../store-errors.js';
+
+export {
+  createAssetHttpHandler,
+  DEFAULT_MAX_ASSET_BYTES,
+  DEFAULT_MAX_ASSET_META_BYTES,
+  DEFAULT_MAX_ASSET_PARTS,
+  DEFAULT_MAX_ASSET_REQUEST_BYTES,
+  DEFAULT_SIGNED_URL_TTL_SECONDS,
+  type AssetByteEgress,
+  type AssetIndirectByteEgress,
+  type AssetHttpAuthenticate,
+  type AssetHttpAuthorize,
+  type AssetHttpHandlerOptions,
+} from './asset.js';
+
+export {
+  createDocumentHttpHandler,
+  type DocumentHttpAuthenticate,
+  type DocumentHttpAuthorize,
+  type DocumentHttpHandlerOptions,
+  type DocumentHttpPrincipal,
+} from './document.js';
 
 export interface RuntimeHttpPrincipal {
   learnerKey?: string;
@@ -53,6 +86,8 @@ export interface RuntimeHttpHandlerOptions {
    * pass the same table configured on the injected store.
    */
   payloadValidators?: Record<string, RuntimePayloadValidator>;
+  /** Maximum JSON request-body size in bytes. Defaults to 32 MiB. */
+  maxBodyBytes?: number;
 }
 
 interface ErrorBody {
@@ -74,8 +109,13 @@ class RuntimeHttpError extends Error {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json' });
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): void {
+  res.writeHead(status, { 'content-type': 'application/json', ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -84,30 +124,19 @@ function sendNoContent(res: ServerResponse): void {
   res.end();
 }
 
-async function readJson<T>(req: IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-  }
-  if (chunks.length === 0) {
-    throw validationFailure('request body must be a JSON object');
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
-  } catch (error) {
-    throw validationFailure(error instanceof Error ? error.message : String(error));
-  }
-  if (!isObject(body)) throw validationFailure('request body must be a JSON object');
-  return body as T;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function validationFailure(message: string, details?: unknown): RuntimeHttpError {
   return new RuntimeHttpError(400, 'VALIDATION_FAILED', message, details);
+}
+
+function payloadTooLarge(message: string): RuntimeHttpError {
+  return new RuntimeHttpError(413, 'PAYLOAD_TOO_LARGE', message);
+}
+
+function readJson<T>(req: IncomingMessage, maxBodyBytes: number): Promise<T> {
+  return readJsonObject(req, maxBodyBytes, {
+    invalid: validationFailure,
+    payloadTooLarge,
+  });
 }
 
 function validationError(result: ValidationResult, label: string): void {
@@ -334,7 +363,37 @@ function parsePath(req: IncomingMessage): { parts: string[]; url: URL } {
   }
 }
 
-function mappedError(error: unknown): { status: number; body: ErrorBody } {
+function isSessionExists(error: unknown): boolean {
+  if (error instanceof RuntimeSessionExistsError) return true;
+  return (
+    error instanceof Error &&
+    error.name === 'RuntimeSessionExistsError' &&
+    (error as { code?: unknown }).code === 'SESSION_ALREADY_EXISTS'
+  );
+}
+
+function isStageNotFound(error: unknown): boolean {
+  if (error instanceof RuntimeStageNotFoundError) return true;
+  return (
+    error instanceof Error &&
+    error.name === 'RuntimeStageNotFoundError' &&
+    (error as { code?: unknown }).code === 'STAGE_NOT_FOUND'
+  );
+}
+
+function mappedError(error: unknown): {
+  status: number;
+  body: ErrorBody;
+  headers?: Record<string, string>;
+} {
+  const policy = storePolicyResponse(error);
+  if (policy) {
+    return {
+      status: policy.status,
+      body: { error: { code: policy.code, message: policy.message } },
+      headers: policy.headers,
+    };
+  }
   if (error instanceof RuntimeAppendConflictError) {
     return {
       status: 409,
@@ -349,6 +408,12 @@ function mappedError(error: unknown): { status: number; body: ErrorBody } {
           },
         },
       },
+    };
+  }
+  if (isStageNotFound(error)) {
+    return {
+      status: 404,
+      body: { error: { code: 'STAGE_NOT_FOUND', message: '@openmaic/storage: stage not found' } },
     };
   }
   if (error instanceof RuntimeHttpError && error.status < 500) {
@@ -406,7 +471,10 @@ async function route(
   }
 
   if (method === 'POST' && parts.length === 2 && parts[1] === 'sessions') {
-    const init = await readJson<RuntimeSessionInit & { runtimeDslVersion?: unknown }>(req);
+    const init = await readJson<RuntimeSessionInit & { runtimeDslVersion?: unknown }>(
+      req,
+      options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    );
     assertAddressableSegment(init.id);
     assertAddressableSegment(init.stageId);
     assertAddressableSegment(init.learnerKey, 'learnerKey');
@@ -419,9 +487,12 @@ async function route(
       { ...init, runtimeDslVersion: RUNTIME_DSL_VERSION },
       `runtime session ${JSON.stringify(init.id)}`,
     );
+    // A taken id answers 409 whoever holds it. Session ids are one global key
+    // space, so a create over a taken id fails either way; checking the
+    // holder first would answer 403 for another learner's session and 409 for
+    // one's own, telling a caller whose sessions exist.
     const existing = await store.getSession(init.id);
     if (existing !== undefined) {
-      requireLearner(principal, existing.learnerKey);
       throw new RuntimeHttpError(
         409,
         'SESSION_ALREADY_EXISTS',
@@ -434,8 +505,9 @@ async function route(
       // A post-failure existence check classifies duplicate races without
       // depending on a database driver's message text.
       const raced = await store.getSession(init.id);
-      if (raced !== undefined) {
-        requireLearner(principal, raced.learnerKey);
+      // The store's own taken-id refusal is authoritative: the re-read above
+      // can miss a holder a host-side wrapper hides from reads.
+      if (raced !== undefined || isSessionExists(error)) {
         throw new RuntimeHttpError(
           409,
           'SESSION_ALREADY_EXISTS',
@@ -457,7 +529,7 @@ async function route(
     if (method === 'PATCH' && parts.length === 4 && parts[3] === 'status') {
       const body = await readJson<
         { status: RuntimeSessionStatus; updatedAt: string } & RuntimeTailOptions
-      >(req);
+      >(req, options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
       const session = await writableSession(store, principal, sessionId);
       validationError(
         validateRuntimeSession({ ...session, status: body.status, updatedAt: body.updatedAt }),
@@ -493,6 +565,7 @@ async function route(
     if (method === 'POST' && parts.length === 4 && parts[3] === 'records') {
       const body = await readJson<RuntimeRecordInit & RuntimeAppendOptions & { seq?: unknown }>(
         req,
+        options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
       );
       const { expectedLastSeq, sessionTransition, ...init } = body;
       if (init.sessionId !== sessionId) {
@@ -588,7 +661,10 @@ async function route(
   }
 
   if (method === 'POST' && parts.length === 3 && parts[1] === 'learners' && parts[2] === 'merge') {
-    const body = await readJson<{ fromLearnerKey?: unknown; toLearnerKey?: unknown }>(req);
+    const body = await readJson<{ fromLearnerKey?: unknown; toLearnerKey?: unknown }>(
+      req,
+      options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    );
     if (
       typeof body.fromLearnerKey !== 'string' ||
       body.fromLearnerKey === '' ||
@@ -657,6 +733,7 @@ export function createRuntimeHttpHandler(
   if (typeof options?.authenticate !== 'function') {
     throw new Error('@openmaic/storage: createRuntimeHttpHandler requires authenticate');
   }
+  assertMaxBodyBytes(options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   return (req, res) => {
     void route(req, res, store, options).catch((error: unknown) => {
       if (res.headersSent) {
@@ -665,12 +742,101 @@ export function createRuntimeHttpHandler(
       }
       if (
         (!(error instanceof RuntimeHttpError) || error.status >= 500) &&
-        !(error instanceof RuntimeAppendConflictError)
+        !(error instanceof RuntimeAppendConflictError) &&
+        !isStageNotFound(error)
       ) {
         console.error('@openmaic/storage: Runtime HTTP handler internal error', error);
       }
       const mapped = mappedError(error);
-      sendJson(res, mapped.status, mapped.body);
+      sendJson(res, mapped.status, mapped.body, mapped.headers);
     });
+  };
+}
+
+export interface StorageHttpHandlerOptions
+  extends
+    RuntimeHttpHandlerOptions,
+    Pick<DocumentHttpHandlerOptions, 'authorizeDocuments' | 'validateScene' | 'validateStage'>,
+    Pick<
+      AssetHttpHandlerOptions,
+      | 'authorizeAssets'
+      | 'renderableTypes'
+      | 'maxRequestBytes'
+      | 'maxAssetBytes'
+      | 'maxMetaBytes'
+      | 'maxParts'
+      | 'byteEgress'
+    > {
+  /** When supplied, the composed handler exposes the `/assets` contract. */
+  assetStore?: AssetStore;
+}
+
+/**
+ * Compose the runtime, optional author-document, and optional asset contracts
+ * into one request handler. Existing runtime routing is delegated unchanged;
+ * the other handlers share its authentication hook.
+ */
+export function createStorageHttpHandler<
+  TScene extends SceneLike = Scene,
+  TStage extends Stage = Stage,
+>(
+  runtimeStore: RuntimeStore,
+  documentStore: DocumentStore<TScene, TStage> | undefined,
+  options: StorageHttpHandlerOptions,
+): RequestListener {
+  const runtime = createRuntimeHttpHandler(runtimeStore, options);
+  const documents =
+    documentStore === undefined
+      ? undefined
+      : createDocumentHttpHandler(documentStore, {
+          authenticate: options.authenticate,
+          ...(options.authorizeDocuments === undefined
+            ? {}
+            : { authorizeDocuments: options.authorizeDocuments }),
+          ...(options.validateScene === undefined ? {} : { validateScene: options.validateScene }),
+          ...(options.validateStage === undefined ? {} : { validateStage: options.validateStage }),
+          ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
+        });
+  const assets =
+    options.assetStore === undefined
+      ? undefined
+      : createAssetHttpHandler(options.assetStore, {
+          authenticate: async (req) =>
+            (await options.authenticate(req)) as AssetPrincipal | undefined,
+          ...(options.authorizeAssets === undefined
+            ? {}
+            : { authorizeAssets: options.authorizeAssets }),
+          ...(options.renderableTypes === undefined
+            ? {}
+            : { renderableTypes: options.renderableTypes }),
+          ...(options.maxRequestBytes === undefined
+            ? {}
+            : { maxRequestBytes: options.maxRequestBytes }),
+          ...(options.maxAssetBytes === undefined ? {} : { maxAssetBytes: options.maxAssetBytes }),
+          ...(options.maxMetaBytes === undefined ? {} : { maxMetaBytes: options.maxMetaBytes }),
+          ...(options.maxParts === undefined ? {} : { maxParts: options.maxParts }),
+          ...(options.byteEgress === undefined ? {} : { byteEgress: options.byteEgress }),
+        });
+  return (req, res) => {
+    let pathname: string;
+    try {
+      pathname = new URL(req.url ?? '/', 'http://storage.invalid').pathname;
+    } catch {
+      runtime(req, res);
+      return;
+    }
+    if (
+      documents !== undefined &&
+      (pathname === '/documents' || pathname.startsWith('/documents/'))
+    ) {
+      documents(req, res);
+    } else if (
+      assets !== undefined &&
+      (pathname === '/assets' || pathname.startsWith('/assets/'))
+    ) {
+      assets(req, res);
+    } else {
+      runtime(req, res);
+    }
   };
 }
